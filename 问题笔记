@@ -30,7 +30,7 @@ class Config:
         self.CODE_ALIASES = {'代码': '股票代码', '证券代码': '股票代码', '股票代码': '股票代码'}
         # 别名已包含所有常见名称
         self.NAME_ALIASES = {'名称': '股票简称', '股票名称': '股票简称', '股票简称': '股票简称', '简称': '股票简称', '简': '股票简称', '证券名称': '股票简称'} 
-        # === 价格别名修复 v2：新增 '收盘价'，涵盖更多实时行情价格字段 ===
+        # === 价格别名修复 v3：涵盖更多实时行情价格字段 ===
         self.PRICE_ALIASES = {'最新价': '最新价', '现价': '最新价', '当前价格': '最新价', '今收盘': '最新价', '收盘': '最新价', '收盘价': '最新价'}
 
 
@@ -146,7 +146,7 @@ class StockAnalyzer:
         df.drop_duplicates(subset=['股票代码'], inplace=True)
         df['股票代码'] = df['股票代码'].astype(str).str.zfill(6)
 
-        # === 核心修复点：强制对 '最新价' 字段进行数值转换 ===
+        # === 核心修复点：强制对 '最新价' 字段进行数值转换 (确保是数字类型，无效值转为 NaN) ===
         if '最新价' in df.columns:
             # 使用 errors='coerce' 将任何非数字值强制转换为 NaN，确保列类型为 float
             df['最新价'] = pd.to_numeric(df['最新价'], errors='coerce')
@@ -524,10 +524,17 @@ class StockAnalyzer:
 
         if not all_codes: return pd.DataFrame()
         final_df = pd.DataFrame(list(all_codes), columns=['股票代码'])
+        
+        # V3 修复点 1A: 确保最终代码列表是字符串类型
+        final_df['股票代码'] = final_df['股票代码'].astype(str)
 
         # 2. 鲁棒地合并基础信息 (简称, 价格)
         spot_df = processed_data.get('spot_data_all', pd.DataFrame())
         report_df_base = processed_data.get('processed_main_report', pd.DataFrame())
+        
+        # V3 修复点 1B: 确保实时行情代码列表是字符串类型
+        if '股票代码' in spot_df.columns:
+             spot_df['股票代码'] = spot_df['股票代码'].astype(str)
 
         # 2a. 构建名称源：从实时行情和研报数据中收集名称
         name_source_spot = spot_df[['股票代码', '股票简称']].drop_duplicates(subset=['股票代码']) if '股票简称' in spot_df.columns else pd.DataFrame()
@@ -540,13 +547,16 @@ class StockAnalyzer:
         final_df = pd.merge(final_df, all_names, on='股票代码', how='left')
         
         # 合并价格 (仅从实时行情获取)
-        # 注意：这里的 spot_df 已经过 _clean_and_standardize 处理，其 '最新价' 已经是数值类型或 NaN
         price_source = spot_df[['股票代码', '最新价']].drop_duplicates(subset=['股票代码'])
         final_df = pd.merge(final_df, price_source, on='股票代码', how='left')
         
+        # V3 修复点 2: 打印诊断信息
+        valid_prices_count = final_df['最新价'].notna().sum()
+        print(f"  - 实时行情数据 (最新价) 成功合并数量: {valid_prices_count} / {len(final_df)}")
+        
         # 2d. 填充空值
         final_df['股票简称'] = final_df['股票简称'].fillna('N/A')
-        # 将价格的 NaN 填充为 'N/A'
+        # 将价格的 NaN 填充为 'N/A' (如果仍然是 NaN，说明源数据没有有效价格)
         final_df['最新价'] = final_df['最新价'].fillna('N/A')
 
 
@@ -566,7 +576,7 @@ class StockAnalyzer:
         final_df['完全多头排列'] = final_df['完全多头排列'].fillna('否')
 
         # C. 资金流向 (标记前100)
-        fund_flow_codes = processed_data['market_fund_flow_raw']['股票代码'].head(100).tolist()
+        fund_flow_codes = processed_data['market_fund_flow_raw']['股票代码'].tolist()
         final_df['资金流入前100'] = final_df['股票代码'].apply(lambda x: '是' if x in fund_flow_codes else '否')
 
         # D. 强势股池
@@ -711,7 +721,7 @@ class StockAnalyzer:
                     col_width = min(max_len + 2, 30)
 
                     # 修复：确保 '最新价' 列被正确识别为货币格式
-                    if col == '最新价' or '价格' in col or '价' in col or '值' in col or '线' in col:
+                    if col == '最新价' or '价格' in col or '价' in col or '线' in col or '均线' in col:
                         worksheet.set_column(i, i, col_width, currency_format)
                     elif '代码' in col:
                         worksheet.set_column(i, i, 10, code_format)
