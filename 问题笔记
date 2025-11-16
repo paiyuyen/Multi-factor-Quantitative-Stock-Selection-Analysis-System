@@ -1,8 +1,20 @@
-[ERROR] 错误：计算 688091 的技术指标时出错: single positional indexer is out-of-bounds，已跳过。
-[ERROR] 错误：计算 688147 的技术指标时出错: single positional indexer is out-of-bounds，已跳过。
-[ERROR] 错误：计算 688169 的技术指标时出错: single positional indexer is out-of-bounds，已跳过。
-[ERROR] 错误：计算 688222 的技术指标时出错: single positional indexer is out-of-bounds，已跳过。
-[ERROR] 错误：计算 688223 的技术指标时出错: single positional indexer is out-of-bounds，已跳过。
-[ERROR] 错误：计算 688302 的技术指标时出错: single positional indexer is out-of-bounds，已跳过。
-[ERROR] 错误：计算 688410 的技术指标时出错: single positional indexer is out-of-bounds，已跳过。
-[ERROR] 错误：计算 688499 的技术指标时出错: single positional indexer is out-of-bounds，已跳过。
+_20251116.txt
+正在将实时价格合并到均线数据集中...
+均线数据合并与过滤完成，符合条件的股票数量: 0
+[FATAL] 致命错误：数据分析流程意外终止。原因: '股票代码'
+Traceback (most recent call last):
+  File "C:\Users\y84189905\PycharmProjects\Corenews\Corenews_Main.py", line 1227, in <module>
+    pipeline.run()
+    ~~~~~~~~~~~~^^
+  File "C:\Users\y84189905\PycharmProjects\Corenews\Corenews_Main.py", line 1153, in run
+    all_ta_codes = set(processed_profit_data['股票代码'].tolist())
+                       ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^
+  File "C:\Users\y84189905\PycharmProjects\Corenews\.venv1\Lib\site-packages\pandas\core\frame.py", line 4113, in __getitem__
+    indexer = self.columns.get_loc(key)
+  File "C:\Users\y84189905\PycharmProjects\Corenews\.venv1\Lib\site-packages\pandas\core\indexes\range.py", line 417, in get_loc
+    raise KeyError(key)
+KeyError: '股票代码'
+
+>>> 流程结束。总耗时: 242.73 秒。
+
+进程已结束，退出代码为 1
