@@ -5,7 +5,7 @@ import time
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
-from typing import Callable, Dict, Any, Tuple
+from typing import Callable, Dict, Any, List
 import pandas_ta as ta
 import numpy as np
 import xlsxwriter
@@ -15,10 +15,25 @@ warnings.filterwarnings('ignore', category=pd.errors.SettingWithCopyWarning)
 
 
 # ==============================================================================
-# 工具函数
+# 核心工具函数和配置
 # ==============================================================================
+class Config:
+    """程序配置类"""
+
+    def __init__(self):
+        self.HOME_DIRECTORY = os.path.expanduser('~')
+        self.SAVE_DIRECTORY = os.path.join(self.HOME_DIRECTORY, 'Downloads', 'CoreNews_Reports')
+        self.TEMP_DATA_DIRECTORY = os.path.join(self.SAVE_DIRECTORY, 'ShareData')
+        self.DATA_FETCH_RETRIES = 3
+        self.DATA_FETCH_DELAY = 5
+        self.MAX_WORKERS = 15
+        self.CODE_ALIASES = {'代码': '股票代码', '证券代码': '股票代码', '股票代码': '股票代码'}
+        self.NAME_ALIASES = {'名称': '股票简称', '股票名称': '股票简称', '股票简称': '股票简称'}
+        self.PRICE_ALIASES = {'最新价': '最新价', '现价': '最新价', '当前价格': '最新价'}
+
+
 def format_stock_code(code: str) -> str:
-    """根据股票代码的开头数字，添加SH或SZ前缀。"""
+    """根据股票代码的开头数字，添加市场前缀。"""
     code_str = str(code).zfill(6)
     if code_str.startswith('6'):
         return 'sh' + code_str
@@ -30,1287 +45,592 @@ def format_stock_code(code: str) -> str:
 
 
 # ==============================================================================
-# 配置类
+# 核心分析类 (集成 Fetching, Processing, Reporting)
 # ==============================================================================
-class Config:
+class StockAnalyzer:
     """
-    程序配置类，用于管理路径、重试次数等全局设置。
+    股票数据获取、处理、分析和报告生成的核心类。
     """
 
     def __init__(self):
-        self.HOME_DIRECTORY = os.path.expanduser('~')
-        self.SAVE_DIRECTORY = os.path.join(self.HOME_DIRECTORY, 'Downloads', 'CoreNews_Reports')
-        self.TEMP_DATA_DIRECTORY = os.path.join(self.SAVE_DIRECTORY, 'ShareData')
-        self.DATA_FETCH_RETRIES = 5
-        self.DATA_FETCH_DELAY = 10
-        self.MAX_WORKERS = 16
-
-
-# ==============================================================================
-# 数据获取类
-# ==============================================================================
-class DataFetcher:
-    """
-    负责从 Akshare 获取数据，并实现缓存和并行下载功能。
-    """
-
-    def __init__(self, config: Config):
-        self.config = config
+        self.config = Config()
         self.today_str = datetime.now().strftime("%Y%m%d")
+        self.temp_dir = self.config.TEMP_DATA_DIRECTORY
+        os.makedirs(self.temp_dir, exist_ok=True)
         self.executor = ThreadPoolExecutor(max_workers=self.config.MAX_WORKERS)
-        os.makedirs(self.config.TEMP_DATA_DIRECTORY, exist_ok=True)
-        self.macd_cache_file = os.path.join(self.config.TEMP_DATA_DIRECTORY, 'MACD_hist_data_cache.txt')
+        self.start_time = time.time()
 
-    def get_file_path(self, base_name: str, is_cleaned: bool = False) -> str:
-        """根据基础文件名和当前日期生成完整的文件路径。如果 is_cleaned 为 True，则添加 '_经清洗' 后缀。"""
-        suffix = "_经清洗" if is_cleaned else ""
-        file_name = f"{base_name}{suffix}_{self.today_str}.txt"
-        return os.path.join(self.config.TEMP_DATA_DIRECTORY, file_name)
+    def _get_file_path(self, base_name: str) -> str:
+        """生成临时数据文件的完整路径。"""
+        file_name = f"{base_name}_{self.today_str}.txt"
+        return os.path.join(self.temp_dir, file_name)
 
-    def load_data_from_txt(self, file_path: str) -> pd.DataFrame:
-        """从 | 分隔的 TXT 文件加载数据。"""
+    def _load_data_from_cache(self, file_path: str) -> pd.DataFrame:
+        """从缓存加载数据。"""
         if os.path.exists(file_path):
             try:
-                # 尝试加载数据
+                # 使用 '|' 分隔符，并确保股票代码是字符串格式
                 df = pd.read_csv(file_path, sep='|', encoding='utf-8', dtype={'股票代码': str})
+                print(f"  - 发现缓存，加载: {os.path.basename(file_path)}")
                 return df
             except Exception as e:
-                print(f"[WARN] 错误：加载临时文件 {os.path.basename(file_path)} 失败: {e}，将重新获取。")
+                print(f"[WARN] 加载缓存 {os.path.basename(file_path)} 失败: {e}，将重新获取。")
         return pd.DataFrame()
 
-    def save_data_to_txt(self, df: pd.DataFrame, file_path: str):
-        """将 DataFrame 保存到 | 分隔的 TXT 文件。"""
+    def _save_data_to_cache(self, df: pd.DataFrame, file_path: str):
+        """保存数据到缓存。"""
         try:
             df.to_csv(file_path, sep='|', index=False, encoding='utf-8')
-            print(f"数据已保存到临时文件: {os.path.basename(file_path)}")
         except Exception as e:
-            print(f"[ERROR] 错误：保存数据到临时文件 {os.path.basename(file_path)} 失败: {e}")
+            print(f"[ERROR] 保存数据到缓存 {os.path.basename(file_path)} 失败: {e}")
 
-    def fetch_with_cache(self, fetch_func: Callable, file_base_name: str, **kwargs: Any) -> pd.DataFrame:
-        """带缓存和重试功能的数据获取函数，优先检查已清洗缓存。"""
+    def _safe_ak_fetch(self, fetch_func: Callable, file_base_name: str, **kwargs: Any) -> pd.DataFrame:
+        """带缓存和重试的 AKShare 数据获取封装。"""
+        file_path = self._get_file_path(file_base_name)
+        cached_df = self._load_data_from_cache(file_path)
+        if not cached_df.empty:
+            return cached_df
 
-        # 1. 优先检查是否存在已清洗的缓存文件
-        cleaned_file_path = self.get_file_path(file_base_name, is_cleaned=True)
-        cached_cleaned_df = self.load_data_from_txt(cleaned_file_path)
-        if not cached_cleaned_df.empty:
-            print(f"发现已清洗缓存文件: {os.path.basename(cleaned_file_path)}，直接加载数据。")
-            return cached_cleaned_df
-
-        # 2. 检查是否存在未清洗的缓存文件
-        raw_file_path = self.get_file_path(file_base_name, is_cleaned=False)
-        cached_raw_df = self.load_data_from_txt(raw_file_path)
-        if not cached_raw_df.empty:
-            print(f"发现原始临时文件: {os.path.basename(raw_file_path)}，直接加载数据。")
-            return cached_raw_df  # 返回未清洗的，让 processor 重新清洗并保存/删除
-
-        # 3. 如果都没有，则进行 API 抓取
         for i in range(self.config.DATA_FETCH_RETRIES):
             try:
-                print(f"正在尝试第 {i + 1}/{self.config.DATA_FETCH_RETRIES} 次获取数据: {file_base_name}...")
+                print(f"  - 正在尝试第 {i + 1}/{self.config.DATA_FETCH_RETRIES} 次获取数据: {file_base_name}...")
                 df = fetch_func(**kwargs)
                 if df is not None and not df.empty:
-                    print("数据获取成功。")
-                    self.save_data_to_txt(df, raw_file_path)  # 保存原始数据
+                    df = self._clean_and_standardize(df, file_base_name)
+                    self._save_data_to_cache(df, file_path)
                     return df
                 else:
-                    print("[WARN] 数据返回为空或无效，将重试。")
+                    print(f"[WARN] 数据返回为空或无效: {file_base_name}，重试中。")
                     time.sleep(self.config.DATA_FETCH_DELAY)
             except Exception as e:
-                print(f"[ERROR] 获取数据时出错: {e}，将在 {self.config.DATA_FETCH_DELAY} 秒后重试。")
+                print(f"[ERROR] 获取 {file_base_name} 时出错: {e}，将在 {self.config.DATA_FETCH_DELAY} 秒后重试。")
                 time.sleep(self.config.DATA_FETCH_DELAY)
-        print(f"[ERROR] 所有重试均失败，将返回空 DataFrame: {file_base_name}")
+        print(f"[FATAL] 所有重试均失败，返回空 DataFrame: {file_base_name}")
         return pd.DataFrame()
 
-    def get_top_industry_stocks(self) -> pd.DataFrame:
-        """
-        获取涨跌幅前五的板块及其成分股，并进行规范化处理。
-        """
-        print("\n>>> 正在获取东方财富-沪深京板块-行业板块数据...")
-        # 1. 获取行业板块名称列表
-        # 注意：这里获取的行业板块名称列表不涉及清洗（ST过滤等），因此不应该调用 clean_data
-        all_industries_df = self.fetch_with_cache(ak.stock_board_industry_name_em, '行业板块名称')
-        if all_industries_df.empty:
-            print("警告：未能获取行业板块名称列表，无法获取成分股。")
+    def _clean_and_standardize(self, df: pd.DataFrame, df_name: str) -> pd.DataFrame:
+        """通用数据清洗和列名标准化。"""
+        if df.empty: return df
+
+        # 1. 标准化列名
+        for old, new in self.config.CODE_ALIASES.items():
+            if old in df.columns: df.rename(columns={old: new}, inplace=True)
+        for old, new in self.config.NAME_ALIASES.items():
+            if old in df.columns: df.rename(columns={old: new}, inplace=True)
+        for old, new in self.config.PRICE_ALIASES.items():
+            if old in df.columns: df.rename(columns={old: new}, inplace=True)
+
+        if '股票代码' not in df.columns:
+            # print(f"[WARN] {df_name} 数据中未找到 '股票代码' 列，跳过清洗。")
             return pd.DataFrame()
-        top_industries = all_industries_df.sort_values(by='涨跌幅', ascending=False).head(10)
-        if top_industries.empty:
-            print("警告：未能找到涨幅前的板块。")
+
+        # 2. 清洗数据
+        df.dropna(subset=['股票代码'], inplace=True)
+        df.drop_duplicates(subset=['股票代码'], inplace=True)
+        df['股票代码'] = df['股票代码'].astype(str).str.zfill(6)
+
+        # 3. 过滤ST股 (需要 '股票简称' 列，如果缺失则临时用代码)
+        if '股票简称' not in df.columns:
+            df['股票简称'] = df['股票代码']  # 临时使用
+
+        cleaned_df = df[~df['股票简称'].str.contains('ST|st|退市|bj|BJ', case=False, na=False)].copy()
+
+        if len(cleaned_df) == 0:
+            print(f"[WARN] {df_name} 数据清洗后为空。")
             return pd.DataFrame()
-        print(f"  - 涨跌幅前排板块是: {top_industries['板块名称'].tolist()}")
+
+        return cleaned_df
+
+    def _get_all_raw_data(self) -> Dict[str, pd.DataFrame]:
+        """集中获取所有数据源。"""
+        print("\n>>> 正在初始化数据获取和缓存检查...")
+
+        # 1. 基础行情和研报数据
+        data = {
+            'spot_data_all': self._safe_ak_fetch(ak.stock_zh_a_spot, "A股实时行情"),
+            'main_report_raw': self._safe_ak_fetch(ak.stock_profit_forecast_em, "主力研报盈利预测"),
+            'financial_abstract_raw': self._safe_ak_fetch(ak.stock_financial_abstract, "财务摘要数据"),
+            'market_fund_flow_raw': self._safe_ak_fetch(ak.stock_fund_flow_individual, "市场资金流向",
+                                                        symbol="5日排行"),
+            'strong_stocks_raw': self._safe_ak_fetch(ak.stock_zt_pool_strong_em, "强势股池", date=datetime.now().strftime('%Y%m%d')),
+            'consecutive_rise_raw': self._safe_ak_fetch(ak.stock_rank_lxsz_ths, "连续上涨"),
+            'ljqs_raw': self._safe_ak_fetch(ak.stock_rank_ljqs_ths, "量价齐升"),
+            'cxfl_raw': self._safe_ak_fetch(ak.stock_rank_cxfl_ths, "持续放量"),
+        }
+
+        # 2. 均线突破数据 (Akshare接口参数不同，需分开获取)
+        data['xstp_10_raw'] = self._safe_ak_fetch(ak.stock_rank_xstp_ths, "向上突破10日均线", symbol="10日均线")
+        data['xstp_30_raw'] = self._safe_ak_fetch(ak.stock_rank_xstp_ths, "向上突破30日均线", symbol="30日均线")
+        data['xstp_60_raw'] = self._safe_ak_fetch(ak.stock_rank_xstp_ths, "向上突破60日均线", symbol="30日均线")
+
+        # 3. 行业板块数据 (成分股需要实时获取，不适合缓存)
+        print("\n>>> 正在获取行业板块成分股...")
+        industry_board_df = self._safe_ak_fetch(ak.stock_board_industry_summary_ths, '行业板块名称')
+        data['top_industry_cons_df'] = self._get_top_industry_constituents(industry_board_df)
+        data['industry_board_df'] = industry_board_df  # 原始板块名称用于报告
+
+        return data
+
+    def _get_top_industry_constituents(self, industry_board_df: pd.DataFrame) -> pd.DataFrame:
+        """获取涨幅前10板块的成分股。"""
+        if industry_board_df.empty or '板块名称' not in industry_board_df.columns:
+            return pd.DataFrame()
+
+        top_industries = industry_board_df.sort_values(by='涨跌幅', ascending=False).head(10)
         all_constituents = []
-        with ThreadPoolExecutor(max_workers=self.config.MAX_WORKERS) as executor:
-            future_to_industry = {
-                executor.submit(
-                    self.fetch_with_cache,
-                    ak.stock_board_industry_cons_em,
-                    f"板块成分股_{row['板块名称']}",
-                    symbol=row['板块名称']
-                ): row['板块名称']
-                for _, row in top_industries.iterrows()
-            }
-            for future in as_completed(future_to_industry):
-                industry_name = future_to_industry[future]
-                try:
-                    constituents_df = future.result()
-                    if not constituents_df.empty:
-                        print(f"  - 成功获取板块 '{industry_name}' 的成分股。")
-                        # 添加板块名称列
-                        constituents_df['所属板块'] = industry_name
-                        # 确保股票代码列为字符串格式，防止0丢失
-                        if '代码' in constituents_df.columns:
-                            constituents_df.rename(columns={'代码': '股票代码'}, inplace=True)
-                        constituents_df['股票代码'] = constituents_df['股票代码'].astype(str).str.zfill(6)
-                        constituents_df['完整股票编码'] = constituents_df['股票代码'].apply(format_stock_code)
-                        all_constituents.append(constituents_df)
-                    else:
-                        print(f"  - 警告：未能获取板块 '{industry_name}' 的成分股数据。")
-                except Exception as e:
-                    print(f"  - [ERROR] 获取板块 '{industry_name}' 成分股时出错: {e}")
+
+        future_to_industry = {
+            self.executor.submit(
+                self._safe_ak_fetch,
+                ak.stock_board_industry_cons_em,
+                f"板块成分股_{row['板块名称']}",  # 使用不同名称防止缓存冲突
+                symbol=row['板块名称']
+            ): row['板块名称']
+            for _, row in top_industries.iterrows()
+        }
+
+        for future in as_completed(future_to_industry):
+            industry_name = future_to_industry[future]
+            constituents_df = future.result()
+            if not constituents_df.empty:
+                if '代码' in constituents_df.columns:
+                    constituents_df.rename(columns={'代码': '股票代码'}, inplace=True)
+                constituents_df['股票代码'] = constituents_df['股票代码'].astype(str).str.zfill(6)
+                constituents_df['所属板块'] = industry_name
+                all_constituents.append(constituents_df[['股票代码', '所属板块']].drop_duplicates())
 
         if all_constituents:
-            merged_df = pd.concat(all_constituents, ignore_index=True)
-            print(f"  - 已合并所有前板块成分股数据，共 {len(merged_df)} 条。")
-            return merged_df
-        else:
-            print("  - 所有板块成分股数据均获取失败。")
-            return pd.DataFrame()
+            return pd.concat(all_constituents, ignore_index=True)
+        return pd.DataFrame()
 
-    # >> 新增持续放量数据的获取方法
-    def fetch_continuous_volume_increase(self) -> pd.DataFrame:
-        """
-        获取同花顺-持续放量数据。
-        接口: ak.stock_rank_cxfl_ths
-        """
-        print("\n>>> 正在获取同花顺-持续放量数据...")
-        # Note: The file base name should match the name used in processor
-        df = self.fetch_with_cache(ak.stock_rank_cxfl_ths, '持续放量')
-        return df
+    def _fetch_hist_data_parallel(self, codes: List[str], days: int) -> pd.DataFrame:
+        """并行获取指定股票的历史数据。"""
+        print(f"\n正在为 {len(codes)} 只股票下载 {days} 天的历史数据...")
 
-    # << 新增持续放量数据的获取方法
-
-    def fetch_hist_data_parallel(self, codes: list, days: int) -> pd.DataFrame:
-        """并行获取指定股票代码的历史数据，并缓存到本地文件。"""
-        print(f"\n正在为 {len(codes)} 只股票下载 {days} 天的历史数据，使用15个线程并行处理。")
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days)
         start_date_str = start_date.strftime("%Y%m%d")
         end_date_str = end_date.strftime("%Y%m%d")
-        if os.path.exists(self.macd_cache_file):
-            # 检查缓存是否过期（例如，如果缓存不是今天创建的，则重新下载）
-            cache_date = datetime.fromtimestamp(os.path.getmtime(self.macd_cache_file)).strftime("%Y%m%d")
-            if cache_date == self.today_str:
-                print(f"发现今日历史数据缓存文件，直接加载。")
-                return pd.read_csv(self.macd_cache_file, sep='|', encoding='utf-8', dtype={'股票代码': str})
-            else:
-                print("发现旧的历史数据缓存文件，将重新下载。")
+
+        file_path = self._get_file_path("MACD_hist_data_cache")
+        cached_df = self._load_data_from_cache(file_path)
+        if not cached_df.empty:
+            return cached_df
 
         all_data = []
-        # 将代码转换为完整的市场编码
         future_to_code = {}
-        with ThreadPoolExecutor(max_workers=15) as executor:
+        with ThreadPoolExecutor(max_workers=self.config.MAX_WORKERS) as executor:
             for code in codes:
                 future = executor.submit(
                     ak.stock_zh_a_hist_tx,
                     symbol=format_stock_code(code),
                     start_date=start_date_str,
                     end_date=end_date_str,
-                    adjust="hfq"
+                    adjust="hfq"  # 前复权
                 )
                 future_to_code[future] = code
 
-            for i, future in enumerate(as_completed(future_to_code)):
+            for future in as_completed(future_to_code):
                 code = future_to_code[future]
                 try:
                     hist_df = future.result()
                     if hist_df is not None and not hist_df.empty:
                         hist_df['股票代码'] = code
-                        # 确保日期是字符串格式，避免excel出错
+                        # 确保日期是字符串格式
                         if '日期' in hist_df.columns:
                             hist_df['日期'] = pd.to_datetime(hist_df['日期']).dt.strftime('%Y-%m-%d')
                         all_data.append(hist_df)
-
                 except Exception as e:
-                    print(f"[ERROR] 错误：获取 {code} 的历史数据时出错: {e}，已跳过。")
+                    # print(f"[ERROR] 错误：获取 {code} 的历史数据时出错: {e}")
+                    pass
+
         if all_data:
             merged_df = pd.concat(all_data, ignore_index=True)
-            self.save_data_to_txt(merged_df, self.macd_cache_file)
+            self._save_data_to_cache(merged_df, file_path)
             return merged_df
-        print("[WARN] 未能成功下载任何股票的历史数据。")
         return pd.DataFrame()
 
+    def _process_ta_signals(self, all_codes: List[str], hist_df_all: pd.DataFrame, spot_df: pd.DataFrame) -> Dict[
+        str, pd.DataFrame]:
+        """计算并提取所有技术指标信号。"""
+        print(f"\n正在对 {len(all_codes)} 只股票进行技术分析...")
+        results = {'MACD': [], 'CCI': [], 'RSI': [], 'BOLL': [], 'KDJ': []}
+        grouped = hist_df_all.groupby('股票代码')
 
-# ==============================================================================
-# 数据处理类
-# ==============================================================================
-class DataProcessor:
-    """
-    负责对获取的数据进行清洗、合并和技术指标计算。
-    """
+        # 预先准备股票简称
+        stock_names = spot_df[['股票代码', '股票简称']].drop_duplicates(subset=['股票代码'])
 
-    def __init__(self, data_fetcher: DataFetcher):
-        self.fetcher = data_fetcher
-        self.executor = ThreadPoolExecutor(max_workers=self.fetcher.config.MAX_WORKERS)
-        self.start_date_for_ta = (datetime.now() - pd.DateOffset(months=6)).strftime("%Y%m%d")
-        self.end_date_for_ta = datetime.now().strftime("%Y%m%d")
-        self.code_aliases = {'代码': '股票代码', '股票代码': '股票代码', '证券代码': '股票代码'}
-        self.name_aliases = {'名称': '股票简称', '股票名称': '股票简称', '股票简称': '股票简称'}
-        self.price_aliases = {'最新价': '最新价', '现价': '最新价'}
+        for code, group_df in grouped:
+            try:
+                if len(group_df) < 30: continue
 
-    def standardize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
-        """标准化 DataFrame 的列名，确保'股票代码'和'股票简称'等列存在。"""
-        if df.empty:
-            return df
-        found_code_col = False
-        for old_name, new_name in self.code_aliases.items():
-            if old_name in df.columns:
-                df.rename(columns={old_name: new_name}, inplace=True)
-                found_code_col = True
-                break
-        if not found_code_col:
-            # print(f"[WARN] 未能在数据中找到股票代码列，原始列名: {df.columns.tolist()}")
-            return pd.DataFrame()
-        found_name_col = False
-        for old_name, new_name in self.name_aliases.items():
-            if old_name in df.columns:
-                df.rename(columns={old_name: new_name}, inplace=True)
-                found_name_col = True
-                break
-        if not found_name_col and '股票简称' not in df.columns:
-            # print(f"[WARN] 未能在数据中找到股票名称列，原始列名: {df.columns.tolist()}")
-            pass  # 允许没有股票简称，但可能有股票代码
-        found_price_col = False
-        for old_name, new_name in self.price_aliases.items():
-            if old_name in df.columns:
-                df.rename(columns={old_name: new_name}, inplace=True)
-                found_price_col = True
-                break
-        if not found_price_col and '最新价' not in df.columns:
-            # print(f"[WARN] 未能在数据中找到价格列，原始列名: {df.columns.tolist()}")
-            pass
-        return df
+                # 确保列名标准化用于 ta 库
+                group_df.rename(columns={'收盘': 'close', '最高': 'high', '最低': 'low'}, inplace=True)
+                if not all(col in group_df.columns for col in ['close', 'high', 'low']): continue
 
-    def clean_data(self, df: pd.DataFrame, df_name: str) -> pd.DataFrame:
-        """通用数据清洗函数，处理缺失值、重复值并去除ST股，并保存清洗后的数据，删除原始文件。"""
-        initial_rows = len(df)
+                # 安全连接指标
+                ta_dfs = [
+                    ta.macd(group_df['close'], append=False),
+                    ta.cci(group_df['high'], group_df['low'], group_df['close'], append=False),
+                    ta.rsi(group_df['close'], length=6, append=False).rename('RSI_6'),
+                    ta.rsi(group_df['close'], length=14, append=False).rename('RSI_14'),
+                    ta.bbands(group_df['close'], append=False),
+                    ta.stoch(group_df['high'], group_df['low'], group_df['close'], append=False)
+                ]
+                group_df_ta = pd.concat([group_df.iloc[-2:], *ta_dfs], axis=1).tail(2)
 
-        # 1. 构造原始文件路径，用于删除
-        today_str = self.fetcher.today_str
-        original_file_name = f"{df_name}_{today_str}.txt"
-        original_file_path = os.path.join(self.fetcher.config.TEMP_DATA_DIRECTORY, original_file_name)
+                if len(group_df_ta) < 2: continue
+                last_day = group_df_ta.iloc[-1]
+                prev_day = group_df_ta.iloc[-2]
+                name = stock_names[stock_names['股票代码'] == code]['股票简称'].iloc[0] if not stock_names[
+                    stock_names['股票代码'] == code].empty else 'N/A'
 
-        # 2. 执行清洗和标准化
-        df = self.standardize_columns(df)
-        if df.empty or '股票代码' not in df.columns:
-            print(f"[WARN] {df_name} 数据标准化失败或为空，跳过清洗。")
-            return pd.DataFrame()
+                # --- 信号检测 ---
+                # MACD 金叉 (DIF > DEA 且前一天 DIF < DEA)
+                if all(c in last_day.index for c in ['MACD_12_26_9', 'MACDs_12_26_9']):
+                    if (prev_day['MACD_12_26_9'] < prev_day['MACDs_12_26_9']) and \
+                            (last_day['MACD_12_26_9'] > last_day['MACDs_12_26_9']):
+                        results['MACD'].append(
+                            {'股票代码': code, '股票简称': name, 'MACD (DIF)': f"{last_day['MACD_12_26_9']:.2f}",
+                             'MACD信号线 (DEA)': f"{last_day['MACDs_12_26_9']:.2f}",
+                             'MACD动能柱': f"{last_day['MACDh_12_26_9']:.2f}"})
 
-        df.dropna(subset=['股票代码'], inplace=True)
-        df.drop_duplicates(subset=['股票代码'], inplace=True)
-        df['股票代码'] = df['股票代码'].astype(str).str.zfill(6)
+                # KDJ 超卖金叉 (K > D 且前一天 K < D 且 K/D < 20)
+                if all(c in last_day.index for c in ['STOCHk_14_3_3', 'STOCHd_14_3_3']):
+                    k, d = last_day['STOCHk_14_3_3'], last_day['STOCHd_14_3_3']
+                    pk, pd_ = prev_day['STOCHk_14_3_3'], prev_day['STOCHd_14_3_3']
+                    if (pk < pd_) and (k > d) and (k < 20 and d < 20):
+                        j = 3 * k - 2 * d
+                        results['KDJ'].append(
+                            {'股票代码': code, '股票简称': name, 'K值': round(k, 2), 'D值': round(d, 2),
+                             'J值': round(j, 2)})
 
-        # 优化：在清洗前添加一个临时的股票简称列，以防缺失，方便ST过滤
-        if '股票简称' not in df.columns:
-            df['股票简称'] = df['股票代码'].astype(str)  # 临时使用代码
+                # CCI 超卖 (CCI 站上 -100)
+                if 'CCI_14_0.015' in last_day.index:
+                    if (prev_day['CCI_14_0.015'] < -100) and (last_day['CCI_14_0.015'] > -100):
+                        results['CCI'].append(
+                            {'股票代码': code, '股票简称': name, '最新CCI值': f"{last_day['CCI_14_0.015']:.2f}"})
 
-        cleaned_df = df[~df['股票简称'].str.contains('ST|st|退市', case=False, na=False)].copy()
+                # RSI 金叉 (RSI6 > RSI14 且前一天 RSI6 < RSI14 且 RSI14 处于 60-80)
+                if all(c in last_day.index for c in ['RSI_6', 'RSI_14']):
+                    if (prev_day['RSI_6'] < prev_day['RSI_14']) and (last_day['RSI_6'] > last_day['RSI_14']) and \
+                            (60 <= last_day['RSI_14'] <= 80):
+                        results['RSI'].append({'股票代码': code, '股票简称': name, 'RSI6': round(last_day['RSI_6'], 2),
+                                               'RSI14': round(last_day['RSI_14'], 2)})
 
-        # 恢复原始的股票简称列（如果临时添加了）
-        if '股票简称' in df.columns and cleaned_df.columns.tolist()[
-            -1] == '股票简称' and '股票简称' not in self.name_aliases.values():
-            pass
+                # BOLL 低波动触及下轨 (收盘价低于中轨，且与下轨距离极近，波动率低)
+                if all(c in last_day.index for c in ['BBU_20_2.0', 'BBM_20_2.0', 'BBL_20_2.0']):
+                    close = last_day['close']
+                    bbm, bbl, bbu = last_day['BBM_20_2.0'], last_day['BBL_20_2.0'], last_day['BBU_20_2.0']
+                    band_width = bbu - bbl
 
-        final_rows = len(cleaned_df)
-        print(f"{df_name} 清洗完成。清洗前：{initial_rows} 条，清洗后：{final_rows} 条。")
+                    is_near_lower_band = (close > bbl) and ((close - bbl) < (band_width * 0.05))
+                    is_low_volatility = (band_width / bbm) < 0.05  # 带宽/中轨 < 5%
 
-        # 3. 构造并保存清洗后的文件
-        cleaned_file_name = f"{df_name}_经清洗_{today_str}.txt"
-        cleaned_file_path = os.path.join(self.fetcher.config.TEMP_DATA_DIRECTORY, cleaned_file_name)
-        self.fetcher.save_data_to_txt(cleaned_df, cleaned_file_path)
+                    if is_near_lower_band and is_low_volatility:
+                        results['BOLL'].append(
+                            {'股票代码': code, '股票简称': name, '最新价格': f"{close:.2f}", '下轨线': f"{bbl:.2f}"})
 
-        # 4. 删除原始文件
-        try:
-            # 只有当原始文件存在（即未命中清洗缓存）时才删除
-            if os.path.exists(original_file_path):
-                os.remove(original_file_path)
-                print(f"已删除原始临时文件: {original_file_name}")
-        except Exception as e:
-            print(f"[WARN] 警告：删除原始文件 {original_file_name} 失败: {e}")
+            except Exception as e:
+                # print(f"[ERROR] 计算股票 {code} 的技术指标时发生意外: {e}")
+                continue
 
-        return cleaned_df
+        return {k: pd.DataFrame(v) for k, v in results.items() if v}
 
-    def process_profit_data(self, df: pd.DataFrame, min_rating: int = 2) -> pd.DataFrame:
-        df = self.clean_data(df, "主力研报盈利预测")
-        if df.empty:
-            return pd.DataFrame()
-        df['机构投资评级(近六个月)-买入'] = pd.to_numeric(df['机构投资评级(近六个月)-买入'], errors='coerce')
-        df = df[df['机构投资评级(近六个月)-买入'] >= min_rating].copy()
-        df['完整股票编码'] = df['股票代码'].apply(format_stock_code)
-        print(f"研报数据过滤完成，符合条件的股票数量: {len(df)}")
-        return df
+    def _process_xstp_and_filter(self, raw_data: Dict[str, pd.DataFrame], spot_df: pd.DataFrame) -> pd.DataFrame:
+        """处理并合并均线突破数据，并进行多头排列筛选。"""
+        print("正在处理并合并均线突破数据...")
 
-    def process_main_report_sheet(self, profit_df: pd.DataFrame, spot_df: pd.DataFrame) -> pd.DataFrame:
-        """生成“主力研报筛选” Sheet 的数据，不再包含股票链接、最新价、序号。"""
-        if profit_df.empty:
-            print("[WARN] 研报数据为空，无法生成主力研报筛选表。")
-            return pd.DataFrame()
+        # 1. 清洗均线数据
+        processed_df10 = raw_data['xstp_10_raw'].rename(columns={'最新价': '10日均线最新价'})
+        processed_df30 = raw_data['xstp_30_raw'].rename(columns={'最新价': '30日均线最新价'})
+        processed_df60 = raw_data['xstp_60_raw'].rename(columns={'最新价': '60日均线最新价'})
 
-        # 1. 使用 profit_df 的拷贝作为基础，不再合并 spot_df 中的 '最新价'
-        final_df = profit_df.copy()
+        # 2. 合并
+        merged_df = pd.concat([
+            processed_df10[['股票代码', '股票简称', '10日均线最新价']].dropna(subset=['股票代码']),
+            processed_df30[['股票代码', '股票简称', '30日均线最新价']].dropna(subset=['股票代码']),
+            processed_df60[['股票代码', '股票简称', '60日均线最新价']].dropna(subset=['股票代码'])
+        ]).drop_duplicates(subset=['股票代码'])
 
-        # 2. 移除不再需要的列：'完整股票编码'（曾用于生成股票链接）
-        cols_to_drop = ['完整股票编码']
+        # 3. 重新合并均线价格，确保同一行有所有数据
+        xstp_base = merged_df[['股票代码', '股票简称']].drop_duplicates()
+        xstp_base = pd.merge(xstp_base, processed_df10[['股票代码', '10日均线最新价']], on='股票代码', how='left')
+        xstp_base = pd.merge(xstp_base, processed_df30[['股票代码', '30日均线最新价']], on='股票代码', how='left')
+        xstp_base = pd.merge(xstp_base, processed_df60[['股票代码', '60日均线最新价']], on='股票代码', how='left')
 
-        for col in cols_to_drop:
-            if col in final_df.columns:
-                final_df.drop(columns=[col], inplace=True)
+        # 4. 合并实时价格 (使用 spot_df 中的 '最新价')
+        xstp_base = pd.merge(xstp_base, spot_df[['股票代码', '最新价']], on='股票代码', how='left')
 
-        # 3. 确保 '股票代码' 和 '股票简称' 在最前面
-        leading_cols = ['股票代码', '股票简称']
-        existing_leading_cols = [col for col in leading_cols if col in final_df.columns]
-        other_cols = [col for col in final_df.columns if col not in existing_leading_cols]
+        # 5. 类型转换和过滤
+        cols_to_convert = [col for col in xstp_base.columns if '最新价' in col or col == '最新价']
+        for col in cols_to_convert:
+            xstp_base[col] = pd.to_numeric(xstp_base[col], errors='coerce')
 
-        # 返回最终筛选后的 DataFrame
-        return final_df[existing_leading_cols + other_cols]
-
-    def process_spot_data(self, spot_data_all: pd.DataFrame, filtered_codes_df: pd.DataFrame) -> pd.DataFrame:
-        """处理实时行情数据，并确保价格列名为'当前价格'。"""
-        # --- 核心修改：移除备用接口的获取和合并逻辑 ---
-        # 仅处理传入的主接口数据
-        spot_data_all = self.clean_data(spot_data_all, "A股实时行情")
-
-        if spot_data_all.empty or filtered_codes_df.empty:
-            # 如果是空DF，则只返回 spot_data_all 的清洗结果
-            return spot_data_all
-
-        # 核心修复：确保价格列名为'当前价格'，以便在 find_recommended_stocks_with_score 中区分使用
-        if '最新价' in spot_data_all.columns:
-            spot_data_all.rename(columns={'最新价': '当前价格'}, inplace=True)
-        elif '现价' in spot_data_all.columns:
-            spot_data_all.rename(columns={'现价': '当前价格'}, inplace=True)
-
-        # 确保合并后保留'股票代码'和'当前价格'
-        # 注意：这里不需要 filtered_codes_df，因为 spot_data_all 是 A股全量的实时行情，直接返回即可
-        return spot_data_all[['股票代码', '股票简称', '当前价格']].drop_duplicates(subset=['股票代码'])
-        # -----------------------------------------------
-
-    def process_financial_abstract(self, df: pd.DataFrame) -> pd.DataFrame:
-        """处理财务摘要数据，进行清洗和格式化。"""
-        return self.clean_data(df, "财务摘要数据")
-
-    def process_market_fund_flow(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        处理市场资金流向数据 (5日排行)。
-        """
-        # 注意：clean_data 会将价格列（如'最新价'）标准化为 '最新价'
-        df = self.clean_data(df, "市场资金流向")
-        if df.empty:
-            print("警告：未能获取市场资金流向数据。")
-            return pd.DataFrame()
-        # 按照“流入资金”字段倒序排序
-        if '流入资金' in df.columns:
-            df['流入资金'] = pd.to_numeric(df['流入资金'], errors='coerce')
-            df = df.sort_values(by='流入资金', ascending=False).copy()
-        else:
-            print("警告：未能找到 '流入资金' 列进行排序。")
-        print(f"  - 市场资金流向数据处理成功，共 {len(df)} 条。")
-        return df
-
-    def process_general_rank(self, df: pd.DataFrame, name: str) -> pd.DataFrame:
-        """通用排行榜数据处理，添加股票代码和编码。"""
-        return self.clean_data(df, name)
-
-    # >> 新增持续放量数据处理方法
-    def process_continuous_volume_increase(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        处理持续放量数据，进行清洗和格式化。
-        """
-        df = self.clean_data(df, '持续放量')
-        if df.empty:
-            return pd.DataFrame()
-
-        # 确保 '持续放量天数' 列存在且为数字
-        if '持续放量天数' in df.columns:
-            df['持续放量天数'] = pd.to_numeric(df['持续放量天数'], errors='coerce').fillna(0).astype(int)
-        elif '放量天数' in df.columns:  # 兼容可能出现的字段名
-            df.rename(columns={'放量天数': '持续放量天数'}, inplace=True)
-            df['持续放量天数'] = pd.to_numeric(df['持续放量天数'], errors='coerce').fillna(0).astype(int)
-        else:
-            print("[WARN] '持续放量天数' 或 '放量天数' 列未找到，无法进行评分筛选。")
-            df['持续放量天数'] = 0
-
-        print(f"  - 持续放量数据处理成功，共 {len(df)} 条。")
-        return df
-
-    # << 新增持续放量数据处理方法
-
-    def process_board_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """通用板块数据处理，进行清洗和标准化。"""
-        # 注意：这里的 df_name 要传入 ak.stock_rank_xstp_ths 对应的 base_name
-        return self.clean_data(df, "板块数据")
-
-    # >>> MODIFIED: 将 20/60/90 修改为 10/30/60
-    def process_and_merge_xstp_data(self, df10: pd.DataFrame, df30: pd.DataFrame, df60: pd.DataFrame,
-                                    spot_data_all: pd.DataFrame) -> pd.DataFrame:
-        """处理并合并10日、30日和60日均线数据，并添加实时价格过滤。"""
-        print("正在处理并合并10日、30日和60日均线数据...")
-
-        # 使用 clean_data 并传入正确的 file_base_name
-        processed_df10 = self.clean_data(df10, '向上突破10日均线').rename(columns={'最新价': '10日均线最新价'})
-        processed_df30 = self.clean_data(df30, '向上突破30日均线').rename(columns={'最新价': '30日均线最新价'})
-        processed_df60 = self.clean_data(df60, '向上突破60日均线').rename(columns={'最新价': '60日均线最新价'})
-
-        if processed_df10.empty and processed_df30.empty and processed_df60.empty:
-            print("[WARN] 所有均线数据均为空，无法合并。")
-            return pd.DataFrame()
-
-        # 初始合并 (以 10日线为基础)
-        merged_df = processed_df10[['股票代码', '股票简称', '10日均线最新价']].copy()
-
-        # 合并 30日数据
-        if not processed_df30.empty:
-            merged_df = pd.merge(merged_df, processed_df30[['股票代码', '股票简称', '30日均线最新价']],
-                                 on='股票代码', how='outer', suffixes=('_x', '_y'))
-            merged_df['股票简称'] = merged_df['股票简称_x'].fillna(merged_df['股票简称_y'])
-            merged_df.drop(columns=[c for c in ['股票简称_x', '股票简称_y'] if c in merged_df.columns], inplace=True)
-            merged_df.drop_duplicates(subset=['股票代码'], inplace=True)
-
-        # 合并 60日数据
-        if not processed_df60.empty:
-            merged_df = pd.merge(merged_df, processed_df60[['股票代码', '股票简称', '60日均线最新价']],
-                                 on='股票代码', how='outer', suffixes=('_x', '_y'))
-            merged_df['股票简称'] = merged_df['股票简称_x'].fillna(merged_df['股票简称_y'])
-            merged_df.drop(columns=[c for c in ['股票简称_x', '股票简称_y'] if c in merged_df.columns], inplace=True)
-            merged_df.drop_duplicates(subset=['股票代码'], inplace=True)
-
-        final_cols = ['股票代码', '股票简称', '10日均线最新价', '30日均线最新价', '60日均线最新价']
-        final_merged_df = merged_df[[col for col in final_cols if col in merged_df.columns]].copy()
-        print("正在将实时价格合并到均线数据集中...")
-
-        # 确保用于合并的spot_data_all DataFrame包含正确的列名
-        spot_data_all_temp = spot_data_all.copy()
-        if '最新价' in spot_data_all_temp.columns:
-            spot_data_all_temp.rename(columns={'最新价': '当前价格'}, inplace=True)
-        elif '现价' in spot_data_all_temp.columns:
-            spot_data_all_temp.rename(columns={'现价': '当前价格'}, inplace=True)
-
-        final_merged_df = pd.merge(final_merged_df, spot_data_all_temp[['股票代码', '当前价格']], on='股票代码',
-                                   how='left')
-
-        # 类型转换
-        final_merged_df['10日均线最新价'] = pd.to_numeric(final_merged_df['10日均线最新价'], errors='coerce')
-        final_merged_df['30日均线最新价'] = pd.to_numeric(final_merged_df['30日均线最新价'], errors='coerce')
-        final_merged_df['60日均线最新价'] = pd.to_numeric(final_merged_df['60日均线最新价'], errors='coerce')
-        final_merged_df['当前价格'] = pd.to_numeric(final_merged_df['当前价格'], errors='coerce')
-
-        # 集中执行所有过滤条件:
-        # 1. 名称不为空 2. 10日均线不为空 3. 当前价格不为空 4. 当前价格 > 10日均线
-        filtered_df = final_merged_df[
-            (final_merged_df['股票简称'].notna()) &
-            (final_merged_df['10日均线最新价'].notna()) &
-            (final_merged_df['当前价格'].notna()) &
-            (final_merged_df['当前价格'] > final_merged_df['10日均线最新价'])
+        # 过滤条件: 1. 最新价>10日均线 2. 多头排列 (20>60 或 60>90)
+        filtered_df = xstp_base[
+            (xstp_base['最新价'] > xstp_base['10日均线最新价']) &
+            (
+                    (xstp_base['10日均线最新价'] > xstp_base['30日均线最新价'].fillna(-np.inf)) |
+                    (xstp_base['30日均线最新价'] > xstp_base['60日均线最新价'].fillna(-np.inf))
+            )
             ].copy()
 
-        # 5. 添加多头排列条件 (10日>30日 或 30日>60日)
-        # 按照原代码的逻辑实现：
-        filtered_df = filtered_df[
-            (filtered_df['10日均线最新价'] > filtered_df['30日均线最新价'].fillna(-np.inf)) |
-            (filtered_df['30日均线最新价'] > filtered_df['60日均线最新价'].fillna(-np.inf))
-            ].copy()
-
-        # 6. 完全多头排列 (10日>30日>60日) - 可以在这里添加一个额外的列进行标记
-        # 确保非空后再比较
+        # 添加完全多头排列标记
         filtered_df['完全多头排列'] = filtered_df.apply(
             lambda row: '是' if row['10日均线最新价'] > row['30日均线最新价'] and row['30日均线最新价'] > row[
                 '60日均线最新价'] else '否',
             axis=1
         )
 
-        filtered_df.fillna('N/A', inplace=True)
-        print(f"均线数据合并与过滤完成，符合条件的股票数量: {len(filtered_df)}")
-        return filtered_df
+        # 重新命名 '最新价' 为 '当前价格' 以避免与均线价混淆
+        filtered_df.rename(columns={'最新价': '当前价格'}, inplace=True)
+        return filtered_df.fillna('N/A')
 
-    # <<< MODIFIED END
+    def _score_by_rank(self, df: pd.DataFrame, score_col: str, max_score: int = 15) -> pd.DataFrame:
+        """根据排名为 DataFrame 打分，排名第一得 max_score 分。"""
+        if df.empty: return pd.DataFrame()
+        df = df.head(100).reset_index(drop=True)  # 只考虑前100名
+        df[score_col] = df.index.to_series().apply(lambda x: max(1, max_score - x // (100 / max_score)))
+        return df[['股票代码', score_col]]
 
-    # === V3 CORE LOGIC REWRITE: 辅助函数，安全获取最近两天的有效 TA 数据 ===
-    def _get_valid_ta_days(self, group_df: pd.DataFrame, key_col: str) -> Tuple[
-        pd.Series | None, pd.Series | None]:
-        """
-        根据指定的关键技术指标列 (key_col)，从历史数据中安全获取最近两个非 NaN 的交易日数据。
-        如果有效数据少于 2 个，则返回 (None, None)。
+    def _score_by_industry_coverage(self, top_industry_cons_df: pd.DataFrame,
+                                    score_col: str = 'Industry_Score') -> pd.DataFrame:
+        """根据被覆盖的强势板块数量打分。"""
+        if top_industry_cons_df.empty: return pd.DataFrame()
 
-        Args:
-            group_df: 包含已计算 TA 指标的历史数据 DataFrame。
-            key_col: 用于判断有效性的关键 TA 列名 (e.g., 'MACDh_12_26_9')。
+        stock_counts = top_industry_cons_df['股票代码'].value_counts().reset_index()
+        stock_counts.columns = ['股票代码', '板块覆盖次数']
 
-        Returns:
-            (prev_day: pd.Series | None, last_day: pd.Series | None)
-        """
-        if key_col not in group_df.columns:
-            return None, None
+        max_count = stock_counts['板块覆盖次数'].max()
+        if max_count == 0: return pd.DataFrame()
 
-        # 严格筛选：只保留关键 TA 指标非空的历史数据，然后取最近两行
-        recent_data = group_df.dropna(subset=[key_col]).tail(2)
+        # 分数 = 覆盖次数 / 最大覆盖次数 * 10 (基准分)
+        stock_counts[score_col] = (stock_counts['板块覆盖次数'] / max_count) * 10
+        stock_counts[score_col] = stock_counts[score_col].round().astype(int)
 
-        # 核心检查：必须有至少 2 个连续的有效数据点才能进行金叉/死叉判断
-        if len(recent_data) < 2:
-            return None, None
+        return stock_counts[['股票代码', score_col]]
 
-        # 返回倒数第二个和倒数第一个数据点
-        return recent_data.iloc[-2], recent_data.iloc[-1]
+    def _calculate_all_scores(self, processed_data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+        """合并所有评分结果，计算总分。"""
+        print("\n>>> 正在汇总和计算总分...")
 
-    # === V3 CORE LOGIC REWRITE END ===
-
-    def process_all_technical_indicators(self, all_ta_codes: list, hist_df_all: pd.DataFrame,
-                                         source_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-        """集中处理所有技术指标，避免重复计算。"""
-        print(f"\n正在对 {len(all_ta_codes)} 只股票进行批量技术分析...")
-        # 新增 'kdj' 结果列表
-        results = {'macd': [], 'cci': [], 'rsi': [], 'boll': [], 'kdj': []}
-        grouped = hist_df_all.groupby('股票代码')
-
-        # 预先清理股票信息，用于查找简称
-        source_df_clean = source_df[['股票代码', '股票简称']].drop_duplicates(subset=['股票代码'])
-
-        for code, group_df in grouped:
-            try:
-                # 1. 至少需要30条数据才能计算MACD/RSI/CCI/KDJ
-                if len(group_df) < 30:
-                    continue
-
-                # 2. 保证索引从0开始，避免iloc问题
-                group_df.reset_index(drop=True, inplace=True)
-
-                # 3. 确保列名标准化
-                group_df.rename(columns={'收盘': 'close', '最高': 'high', '最低': 'low'}, inplace=True)
-
-                # 4. **V3 核心修复**：强制转换为数值类型，将非数值转为 NaN
-                for col in ['close', 'high', 'low', 'open', 'volume']:
-                    if col in group_df.columns:
-                        group_df[col] = pd.to_numeric(group_df[col], errors='coerce')
-
-                # 5. 再次检查，如果关键价格列包含太多 NaN (例如，整只股票停牌) 则跳过
-                if group_df['close'].dropna().empty:
-                    print(f"[WARN] 警告：股票 {code} 的收盘价数据全部无效或为空，已跳过 TA 计算。")
-                    continue
-
-                # 6. 计算所有指标
-                macd_cols = ta.macd(group_df['close'], append=False)
-                cci_cols = ta.cci(group_df['high'], group_df['low'], group_df['close'], append=False)
-                rsi6_cols = ta.rsi(group_df['close'], length=6, append=False).rename('RSI_6')
-                rsi14_cols = ta.rsi(group_df['close'], length=14, append=False).rename('RSI_14')
-                boll_cols = ta.bbands(group_df['close'], append=False)
-                kdj_cols = ta.stoch(group_df['high'], group_df['low'], group_df['close'], append=False)
-
-                # 7. 安全地连接所有指标结果
-                group_df = pd.concat([group_df, macd_cols, cci_cols, rsi6_cols, rsi14_cols, boll_cols, kdj_cols],
-                                     axis=1)
-
-                # 8. 获取股票简称
-                stock_info_match = source_df_clean[source_df_clean['股票代码'] == code]
-                stock_abbr = stock_info_match.iloc[0]['股票简称'] if not stock_info_match.empty else 'N/A'
-
-                # --- V3 信号检查：使用 _get_valid_ta_days 确保安全索引 ---
-
-                # --- MACD 信号检查 (MACD金叉) ---
-                prev_day_macd, last_day_macd = self._get_valid_ta_days(group_df, 'MACDh_12_26_9')
-                if prev_day_macd is not None:
-                    is_golden_cross = (prev_day_macd['MACD_12_26_9'] < prev_day_macd['MACDs_12_26_9']) and (
-                            last_day_macd['MACD_12_26_9'] > last_day_macd['MACDs_12_26_9'])
-
-                    if is_golden_cross:
-                        results['macd'].append({
-                            '股票代码': code,
-                            '股票简称': stock_abbr,
-                            'MACD (DIF)': f"{last_day_macd['MACD_12_26_9']:.2f}",
-                            'MACD信号线 (DEA)': f"{last_day_macd['MACDs_12_26_9']:.2f}",
-                            'MACD动能柱': f"{last_day_macd['MACDh_12_26_9']:.2f}",
-                            'MACD买卖信号': '金叉 (买入信号)',
-                        })
-                else:
-                    print(f"[WARN] 警告：股票 {code} 的 MACD 指标有效数据不足2天，跳过 MACD 检查。")
-
-                # --- CCI 信号检查 (超卖区反转) ---
-                # CCI只需要检查最后一天，但我们仍使用2天数据以确保最新数据有效
-                prev_day_cci, last_day_cci = self._get_valid_ta_days(group_df, 'CCI_14_0.015')
-                if prev_day_cci is not None:
-                    is_oversold_signal = prev_day_cci['CCI_14_0.015'] < -100 and last_day_cci['CCI_14_0.015'] > -100
-
-                    if is_oversold_signal:
-                        results['cci'].append({
-                            '股票代码': code,
-                            '股票简称': stock_abbr,
-                            '最新CCI值': f"{last_day_cci['CCI_14_0.015']:.2f}",
-                            'CCI买卖信号': '超卖买入信号',
-                        })
-                else:
-                    print(f"[WARN] 警告：股票 {code} 的 CCI 指标有效数据不足2天，跳过 CCI 检查。")
-
-                # --- RSI 信号检查 (RSI6上穿RSI14) ---
-                # RSI 需要 RSI_6 和 RSI_14 都有效
-                # 我们通过检查更长周期 (RSI_14) 的有效性来保证数据质量
-                prev_day_rsi, last_day_rsi = self._get_valid_ta_days(group_df, 'RSI_14')
-                if prev_day_rsi is not None and 'RSI_6' in last_day_rsi.index and pd.notna(last_day_rsi['RSI_6']):
-                    # RSI 金叉 (RSI6 上穿 RSI14)
-                    is_golden_cross_rsi = (prev_day_rsi['RSI_6'] < prev_day_rsi['RSI_14']) and (
-                            last_day_rsi['RSI_6'] > last_day_rsi['RSI_14'])
-                    # 价格在强势区 (RSI14 位于 60-80 之间)
-                    is_rsi14_in_range = 60 <= last_day_rsi['RSI_14'] <= 80
-
-                    if is_golden_cross_rsi and is_rsi14_in_range:
-                        results['rsi'].append({
-                            '股票代码': code,
-                            '股票简称': stock_abbr,
-                            'RSI6': round(last_day_rsi['RSI_6'], 2),
-                            'RSI14': round(last_day_rsi['RSI_14'], 2),
-                            'RSI买卖信号': '金叉 (买入信号)',
-                        })
-                else:
-                    print(f"[WARN] 警告：股票 {code} 的 RSI 指标有效数据不足2天，跳过 RSI 检查。")
-
-                # --- BOLL 信号检查 (下轨附近低波动) ---
-                # BOLL只需要最后一天数据，但 _get_valid_ta_days 确保 BBL_20_2.0 是有效的
-                _, last_day_boll = self._get_valid_ta_days(group_df, 'BBL_20_2.0')
-                if last_day_boll is not None:
-                    # 检查 1：价格刚触及下轨（收盘价高于下轨线，且与下轨线的距离小于带宽的 5%）
-                    price_diff_to_lower = last_day_boll['close'] - last_day_boll['BBL_20_2.0']
-                    band_width = last_day_boll['BBU_20_2.0'] - last_day_boll['BBL_20_2.0']
-
-                    is_near_lower_band = (last_day_boll['close'] > last_day_boll['BBL_20_2.0']) and \
-                                         (price_diff_to_lower < (band_width * 0.05))
-                    # 检查 2：波动率收窄 (带宽/中轨线 < 5%)
-                    is_low_volatility = (band_width / last_day_boll['BBM_20_2.0']) < 0.05
-
-                    if is_near_lower_band and is_low_volatility:
-                        results['boll'].append({
-                            '股票代码': code,
-                            '股票简称': stock_abbr,
-                            '最新价格': f"{last_day_boll['close']:.2f}",
-                            '下轨线': f"{last_day_boll['BBL_20_2.0']:.2f}",
-                            'BOLL买卖信号': '下轨附近低波动买入',
-                        })
-                else:
-                    print(f"[WARN] 警告：股票 {code} 的 BOLL 指标有效数据不足2天，跳过 BOLL 检查。")
-
-                # --- KDJ 信号检查 (超卖区金叉) ---
-                prev_day_kdj, last_day_kdj = self._get_valid_ta_days(group_df, 'STOCHk_14_3_3')
-                if prev_day_kdj is not None:
-                    k_col = 'STOCHk_14_3_3'
-                    d_col = 'STOCHd_14_3_3'
-
-                    # 1. 判断是否为金叉 (K 上穿 D)
-                    is_kdj_golden_cross = (prev_day_kdj[k_col] < prev_day_kdj[d_col]) and \
-                                          (last_day_kdj[k_col] > last_day_kdj[d_col])
-                    # 2. 判断是否在超卖区 (K < 20 且 D < 20)
-                    is_oversold_golden_cross = is_kdj_golden_cross and \
-                                               (last_day_kdj[k_col] < 20 and last_day_kdj[d_col] < 20)
-
-                    if is_oversold_golden_cross:
-                        results['kdj'].append({
-                            '股票代码': code,
-                            '股票简称': stock_abbr,
-                            'K值': f"{last_day_kdj[k_col]:.2f}",
-                            'D值': f"{last_day_kdj[d_col]:.2f}",
-                            'J值': f"{last_day_kdj['STOCHj_14_3_3']:.2f}",
-                            'KDJ买卖信号': '超卖区金叉 (买入信号)',
-                        })
-                else:
-                    print(f"[WARN] 警告：股票 {code} 的 KDJ 指标有效数据不足2天，跳过 KDJ 检查。")
-
-            except Exception as e:
-                # 捕获任何其他意外错误
-                print(f"[ERROR] 错误：计算股票 {code} 的技术指标时出错: {e}，已跳过。")
-                continue
-
-        # 将结果列表转换为 DataFrame
-        final_results = {}
-        # 【致命错误修复】定义所有技术指标结果的空 DataFrame 结构
-        empty_cols = {
-            'macd': ['股票代码', '股票简称', 'MACD (DIF)', 'MACD信号线 (DEA)', 'MACD动能柱', 'MACD买卖信号'],
-            'cci': ['股票代码', '股票简称', '最新CCI值', 'CCI买卖信号'],
-            'rsi': ['股票代码', '股票简称', 'RSI6', 'RSI14', 'RSI买卖信号'],
-            'boll': ['股票代码', '股票简称', '最新价格', '下轨线', 'BOLL买卖信号'],
-            'kdj': ['股票代码', '股票简称', 'K值', 'D值', 'J值', 'KDJ买卖信号'],
+        # 1. 提取所有有得分的股票代码作为基础
+        all_codes = set()
+        score_sources = {
+            'Report_Score': processed_data['processed_main_report'][['股票代码', '机构投资评级(近六个月)-买入']],
+            'FundFlow_Score': self._score_by_rank(processed_data['market_fund_flow_raw'], 'FundFlow_Score'),
+            'Strong_Score': processed_data['strong_stocks_raw'][['股票代码']].assign(Strong_Score=10),
+            'Rise_Score': processed_data['consecutive_rise_raw'][['股票代码', '连涨天数']].assign(
+                Rise_Score=lambda x: (x['连涨天数'] / x['连涨天数'].max() * 10).round().astype(int)),
+            'LJQS_Score': processed_data['ljqs_raw'][['股票代码']].assign(LJQS_Score=10),
+            'CXFL_Score': processed_data['cxfl_raw'][['股票代码', '放量天数']].assign(
+                CXFL_Score=lambda x: (x['放量天数'] / x['放量天数'].max() * 10).round().astype(int)),
+            'Industry_Score': self._score_by_industry_coverage(processed_data['top_industry_cons_df']),
+            # TA 信号 (有即给分)
+            'MACD_Score': processed_data['MACD'][['股票代码']].assign(MACD_Score=15),
+            'KDJ_Score': processed_data['KDJ'][['股票代码']].assign(KDJ_Score=15),
+            'CCI_Score': processed_data['CCI'][['股票代码']].assign(CCI_Score=10),
+            'RSI_Score': processed_data['RSI'][['股票代码']].assign(RSI_Score=10),
+            'BOLL_Score': processed_data['BOLL'][['股票代码']].assign(BOLL_Score=10),
         }
 
-        for key, value in results.items():
-            if value:
-                final_results[key] = pd.DataFrame(value)
-            else:
-                # 使用正确的列名列表初始化空 DataFrame，修复 "['CCI买卖信号'] not in index"
-                final_results[key] = pd.DataFrame(columns=empty_cols.get(key, ['股票代码', '股票简称']))
+        # 清理和收集所有股票代码
+        for name, df in score_sources.items():
+            if not df.empty and '股票代码' in df.columns:
+                # 特殊处理研报分 (Report_Score)
+                if name == 'Report_Score':
+                    df.rename(columns={'机构投资评级(近六个月)-买入': 'Report_Score'}, inplace=True)
+                    df['Report_Score'] = pd.to_numeric(df['Report_Score'], errors='coerce') * 10
 
-        return final_results
+                # 确保得分列名称正确
+                if name.endswith('_Score') and name != 'Report_Score':
+                    if df.shape[1] > 1 and df.columns[1] != name:
+                        df.rename(columns={df.columns[1]: name}, inplace=True)
 
-    def find_recommended_stocks_with_score(self, macd_df: pd.DataFrame, cci_df: pd.DataFrame, rsi_df: pd.DataFrame,
-                                           boll_df: pd.DataFrame, kdj_df: pd.DataFrame,  # NEW: KDJ
-                                           xstp_df: pd.DataFrame, ljqs_df: pd.DataFrame, cxfl_df: pd.DataFrame,
-                                           # NEW: CXFL
-                                           strong_stocks_df: pd.DataFrame, consecutive_rise_df: pd.DataFrame,
-                                           filtered_spot: pd.DataFrame,
-                                           market_fund_flow_df: pd.DataFrame) -> pd.DataFrame:
-        """
-        根据多个技术指标和筛选条件对股票进行打分和汇总。
-        """
+                all_codes.update(df['股票代码'].unique())
 
-        print("\n>>> 正在进行推荐股票打分和汇总...")
+        if not all_codes: return pd.DataFrame()
+        final_df = pd.DataFrame(list(all_codes), columns=['股票代码'])
 
-        # 0. 预处理 xstp_df 并筛选出符合条件的股票 (完全多头排列)
-        if not xstp_df.empty and '完全多头排列' in xstp_df.columns:
-            # 筛选出可以计入分数的股票 (完全多头排列是 '是')
-            xstp_df_scored = xstp_df[xstp_df['完全多头排列'] == '是'][['股票代码', '股票简称']].copy()
+        # 2. 合并所有得分
+        for df in score_sources.values():
+            if not df.empty and '股票代码' in df.columns:
+                # 确保只有 '股票代码' 和一个分数列
+                score_col = [col for col in df.columns if col.endswith('_Score')][0] if any(
+                    col.endswith('_Score') for col in df.columns) else None
+                if score_col:
+                    final_df = pd.merge(final_df, df[['股票代码', score_col]].drop_duplicates(subset=['股票代码']),
+                                        on='股票代码', how='left')
+
+        # 3. 计算总分
+        score_cols = [col for col in final_df.columns if col.endswith('_Score')]
+        final_df[score_cols] = final_df[score_cols].fillna(0).astype(int)
+        final_df['Total_Score'] = final_df[score_cols].sum(axis=1)
+
+        # 4. 合并股票简称和最新价 (修复 Key Error 的关键区域)
+
+        # 股票简称：优先从实时行情中获取，或从任何一个数据源中获取
+        name_source = processed_data['spot_data_all'][['股票代码', '股票简称']].drop_duplicates(subset=['股票代码'])
+        final_df = pd.merge(final_df, name_source, on='股票代码', how='left')
+
+        # 最新价：从实时行情中获取 (列名为 '最新价')
+        price_source = processed_data['spot_data_all'][['股票代码', '最新价']].drop_duplicates(subset=['股票代码'])
+        # --- 致命错误修复点：防御性合并价格 ---
+        if '最新价' in price_source.columns and '股票代码' in price_source.columns:
+            final_df = pd.merge(final_df, price_source, on='股票代码', how='left')
         else:
-            xstp_df_scored = pd.DataFrame()
+            final_df['最新价'] = 'N/A'  # 无法获取价格
 
-        # 0. 预处理 ljqs_df 并筛选出符合条件的股票 (量价齐升天数 > 1)
-        if not ljqs_df.empty and '量价齐升天数' in ljqs_df.columns:
-            # 确保 '量价齐升天数' 是数字类型
-            ljqs_df['量价齐升天数'] = pd.to_numeric(ljqs_df['量价齐升天数'], errors='coerce').fillna(0).astype(int)
-            # 筛选出可以计入分数的股票 (天数 > 1)
-            ljqs_df_scored = ljqs_df[ljqs_df['量价齐升天数'] > 1].copy()
-        else:
-            ljqs_df_scored = pd.DataFrame()
-
-        # 0. 预处理 cxfl_df 并筛选出符合条件的股票 (持续放量天数 > 1)
-        if not cxfl_df.empty and '持续放量天数' in cxfl_df.columns:
-            # 确保 '持续放量天数' 是数字类型
-            cxfl_df['持续放量天数'] = pd.to_numeric(cxfl_df['持续放量天数'], errors='coerce').fillna(0).astype(int)
-            # 筛选出可以计入分数的股票 (天数 > 1)
-            cxfl_df_scored = cxfl_df[cxfl_df['持续放量天数'] > 1].copy()
-        else:
-            cxfl_df_scored = pd.DataFrame()
-
-        # 1. 将所有可得分的 DF 加入到待合并列表
-        # MODIFIED: 重新将 ljqs_df_scored 加入到候选列表，使其成为筛选依据，并新增 kdj_df
-        input_dfs_to_score = [macd_df, cci_df, xstp_df_scored, rsi_df, boll_df, ljqs_df_scored, cxfl_df_scored, kdj_df]
-        df_to_concat = []
-        for df in input_dfs_to_score:
-            if not df.empty and '股票代码' in df.columns and '股票简称' in df.columns:
-                df_to_concat.append(df[['股票代码', '股票简称']].copy())
-
-        if not df_to_concat:
-            print("[WARN] 未找到任何符合任一条件的股票。")
-            # >> 更新返回列以添加 '最新价'
-            return pd.DataFrame(
-                columns=['股票代码', '股票简称', '最新价', 'MACD买卖信号', 'CCI买卖信号', 'RSI买卖信号', 'KDJ买卖信号',
-                         # NEW
-                         '均线多头排列', 'BOLL波动性信号', '量价齐升天数', '持续放量信号', '持续放量天数', '强势股池',
-                         '连涨天数',
-                         '股票链接'])
-
-        all_codes = pd.concat(df_to_concat, ignore_index=True).drop_duplicates()
-
-        if all_codes.empty:
-            print("[WARN] 未找到任何符合任一条件的股票。")
-            return pd.DataFrame()
-
-        # 清洗 ST 股
-        all_codes = all_codes[~all_codes['股票简称'].str.contains('ST|st|退市', case=False, na=False)].copy()
-        final_df = all_codes.copy()
-
-        # 初始化评分列和信号列
-        final_df['MACD买卖信号'] = '未满足'
-        final_df['CCI买卖信号'] = '未满足'
-        final_df['RSI买卖信号'] = '未满足'
-        final_df['均线多头排列'] = '未满足'
-        final_df['BOLL波动性信号'] = '未满足'
-        final_df['持续放量信号'] = '未满足'
-        final_df['KDJ买卖信号'] = '未满足'  # NEW
-
-        # 定义所有输出的信号列，用于后续的检查和筛选 (不包含 '量价齐升信号')
-        # MODIFIED: Added KDJ
-        signal_cols_for_output = ['MACD买卖信号', 'CCI买卖信号', 'RSI买卖信号', '均线多头排列', 'BOLL波动性信号',
-                                  '持续放量信号', 'KDJ买卖信号']
-
-        def update_df(source_df: pd.DataFrame, column_name: str, check_col: str = None):
-            """更新输出的信号列，仅针对需要输出的列。"""
-            # 修正：当 source_df 为空时，直接返回，避免创建空的 temp_df 导致后续合并错误
-            if source_df.empty or '股票代码' not in source_df.columns or column_name not in final_df.columns:
-                return
-
-            if check_col is None:
-                check_col = column_name
-
-            # 如果源 DF 中没有 check_col，尝试使用 column_name
-            if check_col not in source_df.columns:
-                check_col = column_name
-
-            # 确保 source_df 中有 check_col
-            if check_col not in source_df.columns:
-                return
-
-            temp_df = source_df[['股票代码', check_col]].copy()
-            temp_df.rename(columns={check_col: column_name + '_temp'}, inplace=True)
-
-            # 先合并
-            merged = pd.merge(final_df[['股票代码', column_name]], temp_df, on='股票代码', how='left')
-
-            # 更新
-            final_df[column_name] = merged.apply(
-                lambda row: row[column_name + '_temp'] if pd.notna(row[column_name + '_temp']) and row[
-                    column_name + '_temp'] != 'N/A' else row[column_name],
-                axis=1
-            )
-            # 对均线数据进行特殊处理，不使用 temp 列
-            if column_name == '均线多头排列':
-                final_df[column_name] = final_df['股票代码'].apply(
-                    lambda code: '完全多头排列' if code in xstp_df_scored['股票代码'].tolist() else '未满足'
-                )
-            elif column_name == '持续放量信号':
-                final_df[column_name] = final_df['股票代码'].apply(
-                    lambda code: '已满足' if code in cxfl_df_scored['股票代码'].tolist() else '未满足'
-                )
-
-        # 2. 更新信号列
-        update_df(macd_df, 'MACD买卖信号', 'MACD买卖信号')
-        update_df(cci_df, 'CCI买卖信号', 'CCI买卖信号')
-        update_df(rsi_df, 'RSI买卖信号', 'RSI买卖信号')
-        update_df(boll_df, 'BOLL波动性信号', 'BOLL买卖信号')
-        update_df(kdj_df, 'KDJ买卖信号', 'KDJ买卖信号')  # NEW: KDJ
-        update_df(xstp_df_scored, '均线多头排列')
-        update_df(cxfl_df_scored, '持续放量信号')  # NEW: CXFL
-
-        # 3. 合并强势股池和连涨天数
-        def merge_rank_data(rank_df: pd.DataFrame, name: str) -> pd.DataFrame:
-            if rank_df.empty:
-                return pd.DataFrame(columns=['股票代码', name])
-            temp_df = rank_df[['股票代码']].copy()
-            temp_df[name] = '是'
-            return temp_df.drop_duplicates(subset=['股票代码'])
-
-        # 强势股池
-        strong_df = merge_rank_data(strong_stocks_df, '强势股池')
-        final_df = pd.merge(final_df, strong_df, on='股票代码', how='left')
-        final_df['强势股池'] = final_df['强势股池'].fillna('否')
-
-        # 连涨天数 (直接从原始 DF 取)
-        if not consecutive_rise_df.empty and '连涨天数' in consecutive_rise_df.columns:
-            cr_df_temp = consecutive_rise_df[['股票代码', '连涨天数']].copy()
-            final_df = pd.merge(final_df, cr_df_temp, on='股票代码', how='left', suffixes=('', '_cr'))
-            if '连涨天数_cr' in final_df.columns:
-                final_df['连涨天数'] = final_df['连涨天数_cr'].fillna(0).astype(int)
-                final_df.drop(columns=['连涨天数_cr'], inplace=True)
-        elif '连涨天数' not in final_df.columns:
-            final_df['连涨天数'] = 0
-
-        # >> 合并量价齐升天数 (使用 ljqs_df 原始数据)
-        if not ljqs_df.empty and '量价齐升天数' in ljqs_df.columns and '股票代码' in ljqs_df.columns:
-            ljqs_df_temp = ljqs_df[['股票代码', '量价齐升天数']].copy()
-            # 确保填充了 0
-            ljqs_df_temp['量价齐升天数'] = pd.to_numeric(ljqs_df_temp['量价齐升天数'], errors='coerce').fillna(
-                0).astype(int)
-            final_df = pd.merge(final_df, ljqs_df_temp, on='股票代码', how='left', suffixes=('', '_ljqs'))
-            # 确保最终列名正确，并填充 0
-            if '量价齐升天数_ljqs' in final_df.columns:
-                final_df['量价齐升天数'] = final_df['量价齐升天数_ljqs'].fillna(0).astype(int)
-                final_df.drop(columns=['量价齐升天数_ljqs'], inplace=True)
-            elif '量价齐升天数' not in final_df.columns:
-                final_df['量价齐升天数'] = 0
-        else:
-            final_df['量价齐升天数'] = 0
-
-        # >> 合并持续放量天数 (使用 cxfl_df 原始数据)
-        if not cxfl_df.empty and '持续放量天数' in cxfl_df.columns and '股票代码' in cxfl_df.columns:
-            cxfl_df_temp = cxfl_df[['股票代码', '持续放量天数']].copy()
-            # 确保填充了 0
-            cxfl_df_temp['持续放量天数'] = pd.to_numeric(cxfl_df_temp['持续放量天数'], errors='coerce').fillna(
-                0).astype(int)
-            final_df = pd.merge(final_df, cxfl_df_temp, on='股票代码', how='left', suffixes=('', '_cxfl'))
-            # 确保最终列名正确，并填充 0
-            if '持续放量天数_cxfl' in final_df.columns:
-                final_df['持续放量天数'] = final_df['持续放量天数_cxfl'].fillna(0).astype(int)
-                final_df.drop(columns=['持续放量天数_cxfl'], inplace=True)
-            elif '持续放量天数' not in final_df.columns:
-                final_df['持续放量天数'] = 0
-        else:
-            final_df['持续放量天数'] = 0
-
-        # --- MODIFIED: 重新添加合并最新价的逻辑，使用实时行情作为主要来源，市场资金流向作为备用 ---
-        # 1. Primary source: filtered_spot (A股实时行情), column is '当前价格'
-        primary_price_df = pd.DataFrame()
-        if '当前价格' in filtered_spot.columns:
-            primary_price_df = filtered_spot[['股票代码', '当前价格']].copy()
-            primary_price_df.rename(columns={'当前价格': '最新价'}, inplace=True)
-
-        # 2. Secondary source: market_fund_flow_df (市场资金流向), column is '最新价'
-        secondary_price_df = pd.DataFrame()
-        if '最新价' in market_fund_flow_df.columns:
-            secondary_price_df = market_fund_flow_df[['股票代码', '最新价']].copy()
-
-        # 3. Merge primary price
-        final_df = pd.merge(final_df, primary_price_df, on='股票代码', how='left')
-
-        # 4. Fill missing values with secondary price
-        if not secondary_price_df.empty:
-            # Merge secondary price as a temporary column
-            final_df = pd.merge(final_df, secondary_price_df, on='股票代码', how='left', suffixes=('', '_secondary'))
-            # Fill NaNs in the primary '最新价' column using the secondary column
-            final_df['最新价'] = final_df['最新价'].fillna(final_df['最新价_secondary'])
-            # Drop the temporary column
-            final_df.drop(columns=[c for c in ['最新价_secondary'] if c in final_df.columns], inplace=True)
-
+        # 5. 整理输出
+        final_df['股票简称'] = final_df['股票简称'].fillna('N/A')
         final_df['最新价'] = final_df['最新价'].fillna('N/A')
-        # ---------------------------------------------------------------------------------
 
-        # 4. 计算得分 (每个满足的信号加 1 分)
-        final_df['Score'] = final_df[signal_cols_for_output].apply(
-            lambda row: sum(1 for col in row if '满足' in str(col) or '金叉' in str(col) or '买入' in str(col)),
-            axis=1
-        )
+        final_df = final_df[final_df['Total_Score'] > 0]  # 移除总分为0的股票
+        final_df = final_df.sort_values(by='Total_Score', ascending=False).reset_index(drop=True)
+        final_df.insert(0, '序号', range(1, len(final_df) + 1))
 
-        # 5. 生成股票链接
-        final_df['完整股票编码'] = final_df['股票代码'].apply(format_stock_code)
-        final_df['股票链接'] = final_df['完整股票编码'].apply(
-            lambda code: f"http://quote.eastmoney.com/{code}.html" if code != 'N/A' else 'N/A'
-        )
-        final_df.drop(columns=['完整股票编码'], inplace=True)
+        # 6. 补充 TA 详情信息
+        tech_dfs = {
+            'MACD': processed_data['MACD'], 'KDJ': processed_data['KDJ'], 'CCI': processed_data['CCI'],
+            'RSI': processed_data['RSI'], 'BOLL': processed_data['BOLL']
+        }
+        for indicator, detail_df in tech_dfs.items():
+            if not detail_df.empty:
+                # 仅保留详情列，避免重复合并 '股票简称'
+                detail_cols = [col for col in detail_df.columns if col not in ['股票简称']]
+                final_df = pd.merge(final_df, detail_df[detail_cols], on='股票代码', how='left',
+                                    suffixes=('', f'_{indicator}'))
 
-        # 6. 排序和选取最终列
-        final_df = final_df.sort_values(by='Score', ascending=False)
-        final_cols = ['股票代码', '股票简称', '最新价', 'MACD买卖信号', 'CCI买卖信号', 'RSI买卖信号', 'KDJ买卖信号',
-                      # NEW
-                      '均线多头排列', 'BOLL波动性信号', '量价齐升天数', '持续放量信号', '持续放量天数', '强势股池',
-                      '连涨天数', 'Score',
-                      '股票链接']
-        final_df = final_df[[col for col in final_cols if col in final_df.columns]].copy()
+        # 最终列顺序
+        base_cols = ['序号', '股票代码', '股票简称', '最新价', 'Total_Score']
+        final_cols = base_cols + score_cols + [col for col in final_df.columns if col not in base_cols + score_cols]
+        final_df = final_df[[col for col in final_cols if col in final_df.columns]]
 
-        print(f"推荐股票汇总完成，共 {len(final_df)} 条。")
         return final_df
 
-
-# ==============================================================================
-# Excel报告生成类
-# ==============================================================================
-class ExcelReporter:
-    """
-    负责将处理后的数据导出为结构化的Excel报告。
-    """
-
-    def __init__(self, config: Config):
-        self.config = config
-        self.file_path = os.path.join(self.config.SAVE_DIRECTORY,
-                                      f"主力研报筛选_{datetime.now().strftime('%Y%m%d')}.xlsx")
-        self.writer = None
-        self.workbook = None
+    def _generate_report(self, sheets_data: Dict[str, pd.DataFrame]):
+        """生成 Excel 报告。"""
+        print(f"\n>>> 正在生成 Excel 报告...")
+        report_path = os.path.join(self.config.SAVE_DIRECTORY, f"股票筛选报告_{self.today_str}.xlsx")
 
         try:
-            # 确保文件存在且可写入
-            self.writer = pd.ExcelWriter(self.file_path, engine='xlsxwriter')
-            self.workbook = self.writer.book
-            self.header_format = self.workbook.add_format(
-                {'bold': True, 'align': 'center', 'valign': 'vcenter', 'border': 1, 'bg_color': '#D9D9D9'})
-            self.text_format = self.workbook.add_format({'border': 1})
-            self.link_format = self.workbook.add_format({'border': 1, 'font_color': 'blue', 'underline': 1})
-            self.red_format = self.workbook.add_format({'border': 1, 'font_color': 'red'})
-            self.green_format = self.workbook.add_format({'border': 1, 'font_color': 'green'})
-            self.yellow_format = self.workbook.add_format({'border': 1, 'bg_color': '#FFFF00'})
+            writer = pd.ExcelWriter(report_path, engine='xlsxwriter')
+            workbook = writer.book
+
+            # 定义格式
+            header_format = workbook.add_format(
+                {'bold': True, 'text_wrap': True, 'valign': 'top', 'fg_color': '#D7E4BC', 'border': 1})
+            currency_format = workbook.add_format({'num_format': '#,##0.00'})
+            code_format = workbook.add_format({'num_format': '@'})  # 文本格式
+
+            for sheet_name, df in sheets_data.items():
+                if df is None or df.empty:
+                    print(f"  - 警告：工作表 '{sheet_name}' 数据为空，跳过创建。")
+                    continue
+
+                df.to_excel(writer, sheet_name=sheet_name, startrow=1, header=False, index=False)
+                worksheet = writer.sheets[sheet_name]
+
+                # 写入表头
+                for col_num, value in enumerate(df.columns.values):
+                    worksheet.write(0, col_num, value, header_format)
+
+                # 设置列宽和格式
+                for i, col in enumerate(df.columns):
+                    max_len = max(df[col].astype(str).str.len().max(), len(col))
+                    col_width = min(max_len + 2, 30)
+
+                    if '价格' in col or '价' in col or '值' in col or '线' in col:
+                        worksheet.set_column(i, i, col_width, currency_format)
+                    elif '代码' in col:
+                        worksheet.set_column(i, i, 10, code_format)
+                    else:
+                        worksheet.set_column(i, i, col_width)
+
+            writer.close()
+            print(f"  - 报告已成功生成并保存到: {report_path}")
+
         except Exception as e:
-            print(f"[FATAL] 错误：无法初始化 Excel 写入器: {e}")
+            print(f"[FATAL] 致命错误：生成 Excel 报告失败。原因: {e}")
             raise
-
-    def _write_dataframe(self, df: pd.DataFrame, sheet_name: str, link_col: str = None,
-                         conditional_format: Dict[str, Any] = None):
-        """通用写入DataFrame到Excel的方法。"""
-        if df.empty:
-            print(f"[WARN] {sheet_name} 数据为空，跳过生成该工作表。")
-            return
-        if self.writer is None or self.workbook is None:
-            print(f"[ERROR] Excel 写入器未正确初始化，跳过写入 {sheet_name}。")
-            return
-        try:
-            # 确保 sheet name 不超过 31 个字符
-            safe_sheet_name = sheet_name[:31]
-            worksheet = self.workbook.add_worksheet(safe_sheet_name)
-            # 使用 to_excel 写入数据，不带表头和索引
-            df.to_excel(self.writer, sheet_name=safe_sheet_name, index=False, startrow=1, header=False)
-
-            # 写入表头并设置列宽
-            for col_num, value in enumerate(df.columns):
-                worksheet.write(0, col_num, value, self.header_format)
-                # 尝试根据内容设置一个合理的默认宽度
-                max_len = max(df[value].astype(str).apply(len).max(), len(value)) if not df.empty else len(value)
-                worksheet.set_column(col_num, col_num, max(15, min(30, max_len + 2)), self.text_format)
-
-            # 处理链接列
-            if link_col and link_col in df.columns:
-                link_col_idx = df.columns.get_loc(link_col)
-                for row_num, link in enumerate(df[link_col], 1):
-                    try:
-                        if link and link not in ('N/A', '链接无效'):
-                            # 写入链接，显示文本为 '链接' 或 '点击链接'
-                            display_text = link if sheet_name == '指标汇总' else '链接'
-                            worksheet.write_url(row_num, link_col_idx, str(link), self.link_format,
-                                                display_text)
-                        else:
-                            worksheet.write(row_num, link_col_idx, link, self.text_format)
-                    except Exception as e:
-                        worksheet.write(row_num, link_col_idx, '链接无效', self.red_format)
-                        print(f"[WARN] 警告：写入链接时出错: {e}")
-
-            # 处理条件格式
-            if conditional_format:
-                for cond in conditional_format:
-                    col = cond['column']
-                    col_idx = df.columns.get_loc(col)
-                    check_func = cond['check']
-                    format_obj = cond['format']
-                    for row_num, value in enumerate(df[col], 1):
-                        if check_func(value):
-                            worksheet.write(row_num, col_idx, value, format_obj)
-                        else:
-                            # 确保其他单元格也应用了基本格式
-                            worksheet.write(row_num, col_idx, value, self.text_format)
-
-            print(f"  - 工作表 '{sheet_name}' 写入完成。")
-
-        except Exception as e:
-            print(f"[ERROR] 错误：写入工作表 {sheet_name} 时出错: {e}")
-
-    def generate_report(self, sheets_data: Dict[str, pd.DataFrame]):
-        """根据数据字典生成Excel报告。"""
-        print(f"\n>>> 正在生成 Excel 报告: {os.path.basename(self.file_path)}...")
-
-        # 定义工作表和其对应的配置
-        sheets_config = {
-            '指标汇总': {
-                'df': sheets_data.get('指标汇总'),
-                'link_col': '股票链接',
-                'conditional_format': [
-                    {'column': 'Score', 'check': lambda x: x >= 3, 'format': self.red_format},
-                    {'column': 'MACD买卖信号', 'check': lambda x: '金叉' in str(x), 'format': self.red_format},
-                    {'column': 'CCI买卖信号', 'check': lambda x: '超卖' in str(x), 'format': self.green_format},
-                    {'column': 'RSI买卖信号', 'check': lambda x: '金叉' in str(x), 'format': self.red_format},
-                    # NEW: KDJ 超卖金叉信号使用绿色
-                    {'column': 'KDJ买卖信号', 'check': lambda x: '超卖区金叉' in str(x), 'format': self.green_format},
-                    {'column': '均线多头排列', 'check': lambda x: '完全多头排列' in str(x), 'format': self.red_format},
-                    {'column': 'BOLL波动性信号', 'check': lambda x: '低波动买入' in str(x),
-                     'format': self.yellow_format},
-                    {'column': '持续放量信号', 'check': lambda x: '已满足' in str(x), 'format': self.yellow_format},
-                ]},
-            # '主力研报筛选' 不再包含链接和价格
-            '主力研报筛选': {'df': sheets_data.get('主力研报筛选'), 'link_col': None, 'conditional_format': None},
-            '财务摘要数据': {'df': sheets_data.get('财务摘要数据'), 'link_col': None, 'conditional_format': None},
-            '实时行情': {'df': sheets_data.get('实时行情'), 'link_col': None, 'conditional_format': None},
-            '行业板块': {'df': sheets_data.get('行业板块'), 'link_col': None, 'conditional_format': None},
-            '市场资金流向': {'df': sheets_data.get('市场资金流向'), 'link_col': None, 'conditional_format': None},
-            '前十板块成分股': {'df': sheets_data.get('前十板块成分股'), 'link_col': None, 'conditional_format': None},
-            '均线多头排列': {'df': sheets_data.get('均线多头排列'), 'link_col': None, 'conditional_format': None},
-            '向上突破': {'df': sheets_data.get('向上突破'), 'link_col': None, 'conditional_format': None},
-            '强势股池': {'df': sheets_data.get('强势股池'), 'link_col': None, 'conditional_format': None},
-            '连续上涨': {'df': sheets_data.get('连续上涨'), 'link_col': None, 'conditional_format': None},
-            '量价齐升': {'df': sheets_data.get('量价齐升'), 'link_col': None, 'conditional_format': None},
-            # >> 保持持续放量工作表
-            '持续放量': {'df': sheets_data.get('持续放量'), 'link_col': None, 'conditional_format': None},
-            'MACD金叉': {'df': sheets_data.get('MACD金叉'), 'link_col': None, 'conditional_format': [
-                {'column': 'MACD买卖信号', 'check': lambda x: '金叉' in str(x), 'format': self.red_format}]},
-            'CCI超卖': {'df': sheets_data.get('CCI超卖'), 'link_col': None, 'conditional_format': [
-                {'column': 'CCI买卖信号', 'check': lambda x: '超卖' in str(x), 'format': self.green_format}]},
-            'RSI金叉': {'df': sheets_data.get('RSI金叉'), 'link_col': None, 'conditional_format': [
-                {'column': 'RSI买卖信号', 'check': lambda x: '金叉' in str(x), 'format': self.red_format}]},
-            'BOLL低波': {'df': sheets_data.get('BOLL低波'), 'link_col': None, 'conditional_format': [
-                {'column': 'BOLL买卖信号', 'check': lambda x: '买入' in str(x), 'format': self.yellow_format}]},
-            # NEW SHEET: KDJ 超卖金叉
-            'KDJ超卖金叉': {'df': sheets_data.get('KDJ超卖金叉'), 'link_col': None, 'conditional_format': [
-                {'column': 'KDJ买卖信号', 'check': lambda x: '超卖区金叉' in str(x), 'format': self.green_format}]},
-        }
-
-        # 顺序写入工作表
-        for sheet_name, config in sheets_config.items():
-            self._write_dataframe(config['df'], sheet_name, config['link_col'], config['conditional_format'])
-
-        try:
-            self.writer.close()
-            print(f"\n>>> Excel 报告生成成功: {self.file_path}")
-        except Exception as e:
-            print(f"[ERROR] 错误：关闭 Excel 写入器失败: {e}")
-
-    def cleanup(self):
-        """用于在发生致命错误时清理写入器。"""
-        if self.writer:
-            try:
-                self.writer.close()
-            except:
-                pass
-
-
-# ==============================================================================
-# 主流程类 (新增此部分)
-# ==============================================================================
-
-class CorenewsPipeline:
-    def __init__(self):
-        self.config = Config()
-        self.fetcher = DataFetcher(self.config)
-        self.processor = DataProcessor(self.fetcher)
-        self.reporter = ExcelReporter(self.config)
 
     def run(self):
-        start_time = time.time()
-        print(f"\n>>> 流程开始。当前日期: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        """主运行方法。"""
+        print(f"股票分析程序启动 (Today: {self.today_str})")
+
+        # 清理旧的临时文件 (只清理当日文件以外的)
+        for filename in os.listdir(self.temp_dir):
+            if not filename.endswith(f"{self.today_str}.txt"):
+                try:
+                    os.remove(os.path.join(self.temp_dir, filename))
+                except Exception:
+                    pass
+        print("旧的临时数据文件清理完成。")
 
         try:
-            # 1. 数据获取 (使用用户提供的修正接口)
-            # -----------------------------------------------------------------
-            profit_data_raw = self.fetcher.fetch_with_cache(
-                ak.stock_profit_forecast_em, '主力研报盈利预测'  # 用户修正接口
-            )
-            spot_data_all = self.fetcher.fetch_with_cache(
-                ak.stock_zh_a_spot_em, 'A股实时行情'
-            )
-            market_fund_flow_raw = self.fetcher.fetch_with_cache(
-                ak.stock_fund_flow_individual, '市场资金流向', symbol="5日排行"  # 用户修正接口和参数
-            )
-            financial_abstract_raw = self.fetcher.fetch_with_cache(
-                ak.stock_financial_abstract, '财务摘要数据'  # 用户修正接口
-            )
-            industry_board_df = self.fetcher.fetch_with_cache(
-                ak.stock_board_industry_name_em, '行业板块名称'
-            )
-            top_industry_cons_df = self.fetcher.get_top_industry_stocks()
+            # 1. 获取所有原始数据 (已集成缓存和清洗)
+            raw_data = self._get_all_raw_data()
 
-            df_ma10 = self.fetcher.fetch_with_cache(ak.stock_rank_xstp_ths, '向上突破10日均线', symbol="10日均线")
-            df_ma30 = self.fetcher.fetch_with_cache(ak.stock_rank_xstp_ths, '向上突破30日均线', symbol="30日均线")
-            df_ma60 = self.fetcher.fetch_with_cache(ak.stock_rank_xstp_ths, '向上突破60日均线', symbol="60日均线")
+            # 2. 提取所有参与评分的股票代码 (包括通过研报、资金流向、多头排列等筛选出的)
+            filtered_codes = set()
+            for name, df in raw_data.items():
+                if '股票代码' in df.columns:
+                    filtered_codes.update(df['股票代码'].unique())
 
-            ljqs_df_raw = self.fetcher.fetch_with_cache(ak.stock_rank_ljqs_ths, '量价齐升')
-            cxfl_df_raw = self.fetcher.fetch_continuous_volume_increase()
+            # 3. 历史数据获取和技术指标计算
+            hist_df_all = self._fetch_hist_data_parallel(list(filtered_codes), days=90)
 
-            # 通用排行榜数据获取
-            strong_stocks_raw = self.fetcher.fetch_with_cache(ak.stock_zt_pool_strong_em, '强势股池',
-                                                              date=self.fetcher.today_str)  # 用户修正参数
-            consecutive_rise_raw = self.fetcher.fetch_with_cache(ak.stock_rank_lxsz_ths, '连续上涨')
+            # 4. 技术指标信号提取
+            ta_signals = self._process_ta_signals(list(filtered_codes), hist_df_all, raw_data['spot_data_all'])
 
-            print("\n>>> 正在进行数据处理和筛选...")
+            # 5. 特殊数据处理
+            processed_xstp_df = self._process_xstp_and_filter(raw_data, raw_data['spot_data_all'])
 
-            # 2. 数据处理和筛选
-            # -----------------------------------------------------------------
-            processed_profit_data = self.processor.process_profit_data(profit_data_raw)
-            filtered_spot = self.processor.process_spot_data(spot_data_all, processed_profit_data)
-            main_report_sheet = self.processor.process_main_report_sheet(processed_profit_data, filtered_spot)
-            processed_market_fund_flow = self.processor.process_market_fund_flow(market_fund_flow_raw)
-            processed_financial_abstract = self.processor.process_financial_abstract(financial_abstract_raw)
-
-            processed_xstp_df = self.processor.process_and_merge_xstp_data(
-                df_ma10, df_ma30, df_ma60, spot_data_all
-            )
-
-            processed_strong_stocks = self.processor.process_general_rank(strong_stocks_raw, '强势股池')
-            processed_consecutive_rise = self.processor.process_general_rank(consecutive_rise_raw, '连续上涨')
-            processed_ljqs = self.processor.process_general_rank(ljqs_df_raw, '量价齐升')
-            processed_cxfl = self.processor.process_continuous_volume_increase(cxfl_df_raw)
-
-            # 3. 构建用于技术指标分析的股票池
-            print("\n>>> 正在构建用于技术指标分析的股票池...")
-
-            df_sources = {
-                '研报': processed_profit_data,
-                '均线': processed_xstp_df,
-                '强势': processed_strong_stocks,
-                '连涨': processed_consecutive_rise,
-                '量价': processed_ljqs,
-                '放量': processed_cxfl,
+            # 6. 合并所有数据源和评分结果
+            processed_data = {
+                **raw_data,
+                **ta_signals,
+                'processed_xstp_df': processed_xstp_df,
+                'processed_main_report': self._clean_and_standardize(raw_data['main_report_raw'], "主力研报盈利预测")
+                # 需再次清洗以确保ST过滤
             }
+            recommended_stocks = self._calculate_all_scores(processed_data)
 
-            df_to_concat = []
-
-            for source_name, df in df_sources.items():
-                # 核心修复：检查 DataFrame 是否非空且包含所有需要的列
-                if not df.empty and all(col in df.columns for col in ['股票代码', '股票简称']):
-                    # 只选取关键列并去重
-                    df_to_concat.append(df[['股票代码', '股票简称']].drop_duplicates())
-                elif not df.empty and '股票代码' in df.columns:
-                    # 如果只有代码没有简称，也加入
-                    print(f"[WARN] {source_name} 数据源缺少 '股票简称' 列，仅使用 '股票代码'。")
-                    # 必须确保有 '股票简称' 列，否则后续合并会失败，所以这里应创建一个空的股票简称列
-                    temp_df = df[['股票代码']].drop_duplicates()
-                    temp_df['股票简称'] = 'N/A'
-                    df_to_concat.append(temp_df)
-                elif not df.empty:
-                    print(f"[WARN] {source_name} 数据源非空，但缺少 '股票代码' 列，已跳过。")
-
-            if not df_to_concat:
-                print("[WARN] 警告：用于技术指标分析的股票池为空，无法进行后续技术分析。")
-                ta_source_df = pd.DataFrame(columns=['股票代码', '股票简称'])
-            else:
-                # 合并所有非空数据源
-                ta_source_df = pd.concat(df_to_concat, ignore_index=True).drop_duplicates(subset=['股票代码'])
-
-            all_ta_codes = ta_source_df['股票代码'].unique().tolist()
-
-            # 4. 获取历史数据
-            # -----------------------------------------------------------------
-            if all_ta_codes:
-                hist_df_all = self.fetcher.fetch_hist_data_parallel(all_ta_codes, days=150)
-
-                # 5. 技术指标分析
-                # -----------------------------------------------------------------
-                ta_results = self.processor.process_all_technical_indicators(
-                    all_ta_codes, hist_df_all, ta_source_df
-                )
-
-                macd_df = ta_results.get('macd', pd.DataFrame())
-                cci_df = ta_results.get('cci', pd.DataFrame())
-                rsi_df = ta_results.get('rsi', pd.DataFrame())
-                boll_df = ta_results.get('boll', pd.DataFrame())
-                kdj_df = ta_results.get('kdj', pd.DataFrame())
-
-                # 6. 生成汇总报告
-                # -----------------------------------------------------------------
-                recommended_stocks = self.processor.find_recommended_stocks_with_score(
-                    macd_df, cci_df, rsi_df, boll_df, kdj_df,
-                    processed_xstp_df, processed_ljqs, processed_cxfl,
-                    processed_strong_stocks, processed_consecutive_rise, filtered_spot, processed_market_fund_flow
-                )
-            else:
-                print("[WARN] 股票池为空，跳过历史数据获取和技术指标分析。")
-                # 创建空 DataFrame 以供 Reporter 使用
-                macd_df = cci_df = rsi_df = boll_df = kdj_df = recommended_stocks = pd.DataFrame()
-
-            # 7. 生成 Excel 报告
-            # -----------------------------------------------------------------
+            # 7. 准备报告数据
             sheets_data = {
-                '主力研报筛选': main_report_sheet,
-                '财务摘要数据': processed_financial_abstract,
-                '实时行情': filtered_spot,
-                '行业板块': industry_board_df,
-                '市场资金流向': processed_market_fund_flow,
-                '前十板块成分股': top_industry_cons_df,
-                '均线多头排列': processed_xstp_df,
-                '向上突破': processed_xstp_df,
-                '强势股池': processed_strong_stocks,
-                '连续上涨': processed_consecutive_rise,
-                '量价齐升': processed_ljqs,
-                '持续放量': processed_cxfl,
-                'MACD金叉': macd_df,
-                'CCI超卖': cci_df,
-                'RSI金叉': rsi_df,
-                'BOLL低波': boll_df,
-                'KDJ超卖金叉': kdj_df,
-                '指标汇总': recommended_stocks,
+                '指标汇总(推荐)': recommended_stocks,
+                '主力研报筛选': processed_data['processed_main_report'],
+                '均线多头排列': processed_data['processed_xstp_df'],
+                '实时行情': raw_data['spot_data_all'],
+                '市场资金流向': raw_data['market_fund_flow_raw'],
+                '强势股池': raw_data['strong_stocks_raw'],
+                '连续上涨': raw_data['consecutive_rise_raw'],
+                '量价齐升': raw_data['ljqs_raw'],
+                '持续放量': raw_data['cxfl_raw'],
+                'MACD金叉': processed_data['MACD'],
+                'KDJ超卖金叉': processed_data['KDJ'],
+                'CCI超卖': processed_data['CCI'],
+                'RSI金叉': processed_data['RSI'],
+                'BOLL低波': processed_data['BOLL'],
+                '前十板块成分股': raw_data['top_industry_cons_df'],
             }
 
-            if self.reporter.writer:
-                self.reporter.generate_report(sheets_data)
+            # 8. 生成报告
+            self._generate_report(sheets_data)
 
         except Exception as e:
-            print(f"[FATAL] 致命错误：数据分析流程意外终止。原因: {e}")
-            self.reporter.cleanup()
-            # 保持 raise 语句，以便在主模块中捕获退出代码
+            print(f"\n[FATAL] 致命错误：数据分析流程意外终止。原因: {e}")
             raise
+
         finally:
             end_time = time.time()
-            total_time = end_time - start_time
-            print(f"\n>>> 流程结束。总耗时: {total_time:.2f} 秒。")
+            print(f"\n>>> 流程结束。总耗时: {timedelta(seconds=end_time - self.start_time)}")
 
 
 # ==============================================================================
-# 主程序执行入口 (新增此部分)
+# 主执行入口
 # ==============================================================================
-
 if __name__ == '__main__':
-    pipeline = CorenewsPipeline()
-    try:
-        pipeline.run()
-    except Exception as e:
-        # 捕捉 run() 中抛出的致命错误，避免程序直接崩溃
-        pass
+    analyzer = StockAnalyzer()
+    analyzer.run()
