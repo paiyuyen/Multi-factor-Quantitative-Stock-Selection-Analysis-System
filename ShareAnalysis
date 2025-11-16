@@ -194,7 +194,7 @@ class DataFetcher:
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days)
         start_date_str = start_date.strftime("%Y%m%d")
-        end_date_str = end_date.strftime("%Ym%d")
+        end_date_str = end_date.strftime("%Y%m%d")
         if os.path.exists(self.macd_cache_file):
             # 检查缓存是否过期（例如，如果缓存不是今天创建的，则重新下载）
             cache_date = datetime.fromtimestamp(os.path.getmtime(self.macd_cache_file)).strftime("%Y%m%d")
@@ -448,22 +448,31 @@ class DataProcessor:
         # 注意：这里的 df_name 要传入 ak.stock_rank_xstp_ths 对应的 base_name
         return self.clean_data(df, "板块数据")
 
-    def process_and_merge_xstp_data(self, df20: pd.DataFrame, df60: pd.DataFrame, df90: pd.DataFrame,
+    # >>> MODIFIED: 将 20/60/90 修改为 10/30/60
+    def process_and_merge_xstp_data(self, df10: pd.DataFrame, df30: pd.DataFrame, df60: pd.DataFrame,
                                     spot_data_all: pd.DataFrame) -> pd.DataFrame:
-        """处理并合并20日、60日和90日均线数据，并添加实时价格过滤。"""
-        print("正在处理并合并20日、60日和90日均线数据...")
+        """处理并合并10日、30日和60日均线数据，并添加实时价格过滤。"""
+        print("正在处理并合并10日、30日和60日均线数据...")
 
         # 使用 clean_data 并传入正确的 file_base_name
-        processed_df20 = self.clean_data(df20, '向上突破20日均线').rename(columns={'最新价': '20日均线最新价'})
+        processed_df10 = self.clean_data(df10, '向上突破10日均线').rename(columns={'最新价': '10日均线最新价'})
+        processed_df30 = self.clean_data(df30, '向上突破30日均线').rename(columns={'最新价': '30日均线最新价'})
         processed_df60 = self.clean_data(df60, '向上突破60日均线').rename(columns={'最新价': '60日均线最新价'})
-        processed_df90 = self.clean_data(df90, '向上突破90日均线').rename(columns={'最新价': '90日均线最新价'})
 
-        if processed_df20.empty and processed_df60.empty and processed_df90.empty:
+        if processed_df10.empty and processed_df30.empty and processed_df60.empty:
             print("[WARN] 所有均线数据均为空，无法合并。")
             return pd.DataFrame()
 
-        # 初始合并
-        merged_df = processed_df20[['股票代码', '股票简称', '20日均线最新价']].copy()
+        # 初始合并 (以 10日线为基础)
+        merged_df = processed_df10[['股票代码', '股票简称', '10日均线最新价']].copy()
+
+        # 合并 30日数据
+        if not processed_df30.empty:
+            merged_df = pd.merge(merged_df, processed_df30[['股票代码', '股票简称', '30日均线最新价']],
+                                 on='股票代码', how='outer', suffixes=('_x', '_y'))
+            merged_df['股票简称'] = merged_df['股票简称_x'].fillna(merged_df['股票简称_y'])
+            merged_df.drop(columns=[c for c in ['股票简称_x', '股票简称_y'] if c in merged_df.columns], inplace=True)
+            merged_df.drop_duplicates(subset=['股票代码'], inplace=True)
 
         # 合并 60日数据
         if not processed_df60.empty:
@@ -473,15 +482,7 @@ class DataProcessor:
             merged_df.drop(columns=[c for c in ['股票简称_x', '股票简称_y'] if c in merged_df.columns], inplace=True)
             merged_df.drop_duplicates(subset=['股票代码'], inplace=True)
 
-        # 合并 90日数据
-        if not processed_df90.empty:
-            merged_df = pd.merge(merged_df, processed_df90[['股票代码', '股票简称', '90日均线最新价']],
-                                 on='股票代码', how='outer', suffixes=('_x', '_y'))
-            merged_df['股票简称'] = merged_df['股票简称_x'].fillna(merged_df['股票简称_y'])
-            merged_df.drop(columns=[c for c in ['股票简称_x', '股票简称_y'] if c in merged_df.columns], inplace=True)
-            merged_df.drop_duplicates(subset=['股票代码'], inplace=True)
-
-        final_cols = ['股票代码', '股票简称', '20日均线最新价', '60日均线最新价', '90日均线最新价']
+        final_cols = ['股票代码', '股票简称', '10日均线最新价', '30日均线最新价', '60日均线最新价']
         final_merged_df = merged_df[[col for col in final_cols if col in merged_df.columns]].copy()
         print("正在将实时价格合并到均线数据集中...")
 
@@ -496,38 +497,39 @@ class DataProcessor:
                                    how='left')
 
         # 类型转换
-        final_merged_df['20日均线最新价'] = pd.to_numeric(final_merged_df['20日均线最新价'], errors='coerce')
+        final_merged_df['10日均线最新价'] = pd.to_numeric(final_merged_df['10日均线最新价'], errors='coerce')
+        final_merged_df['30日均线最新价'] = pd.to_numeric(final_merged_df['30日均线最新价'], errors='coerce')
         final_merged_df['60日均线最新价'] = pd.to_numeric(final_merged_df['60日均线最新价'], errors='coerce')
-        final_merged_df['90日均线最新价'] = pd.to_numeric(final_merged_df['90日均线最新价'], errors='coerce')
         final_merged_df['当前价格'] = pd.to_numeric(final_merged_df['当前价格'], errors='coerce')
 
         # 集中执行所有过滤条件:
-        # 1. 名称不为空 2. 20日均线不为空 3. 当前价格不为空 4. 当前价格 > 20日均线
+        # 1. 名称不为空 2. 10日均线不为空 3. 当前价格不为空 4. 当前价格 > 10日均线
         filtered_df = final_merged_df[
             (final_merged_df['股票简称'].notna()) &
-            (final_merged_df['20日均线最新价'].notna()) &
+            (final_merged_df['10日均线最新价'].notna()) &
             (final_merged_df['当前价格'].notna()) &
-            (final_merged_df['当前价格'] > final_merged_df['20日均线最新价'])
+            (final_merged_df['当前价格'] > final_merged_df['10日均线最新价'])
             ].copy()
 
-        # 5. 添加多头排列条件 (20日>60日 或 60日>90日)
+        # 5. 添加多头排列条件 (10日>30日 或 30日>60日)
         # 按照原代码的逻辑实现：
         filtered_df = filtered_df[
-            (filtered_df['20日均线最新价'] > filtered_df['60日均线最新价'].fillna(-np.inf)) |
-            (filtered_df['60日均线最新价'] > filtered_df['90日均线最新价'].fillna(-np.inf))
+            (filtered_df['10日均线最新价'] > filtered_df['30日均线最新价'].fillna(-np.inf)) |
+            (filtered_df['30日均线最新价'] > filtered_df['60日均线最新价'].fillna(-np.inf))
             ].copy()
 
-        # 6. 完全多头排列 (20日>60日>90日) - 可以在这里添加一个额外的列进行标记
+        # 6. 完全多头排列 (10日>30日>60日) - 可以在这里添加一个额外的列进行标记
         # 确保非空后再比较
         filtered_df['完全多头排列'] = filtered_df.apply(
-            lambda row: '是' if row['20日均线最新价'] > row['60日均线最新价'] and row['60日均线最新价'] > row[
-                '90日均线最新价'] else '否',
+            lambda row: '是' if row['10日均线最新价'] > row['30日均线最新价'] and row['30日均线最新价'] > row[
+                '60日均线最新价'] else '否',
             axis=1
         )
 
         filtered_df.fillna('N/A', inplace=True)
         print(f"均线数据合并与过滤完成，符合条件的股票数量: {len(filtered_df)}")
         return filtered_df
+    # <<< MODIFIED END
 
     def process_all_technical_indicators(self, all_ta_codes: list, hist_df_all: pd.DataFrame,
                                          source_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
@@ -1090,7 +1092,7 @@ class StockDataPipeline:
         self.processor = DataProcessor(self.fetcher)
         self.reporter = ExcelReporter(self.config)
 
-    # >> 修改 run 方法
+    # >> 修改 run 方法 (使用 10日/30日/60日均线)
     def run(self):
 
         start_time = time.time()
@@ -1114,9 +1116,11 @@ class StockDataPipeline:
                                                                  date=self.fetcher.today_str)
 
             consecutive_rise_df_raw = self.fetcher.fetch_with_cache(ak.stock_rank_lxsz_ths, '连续上涨')
-            df_ma20 = self.fetcher.fetch_with_cache(ak.stock_rank_xstp_ths, '向上突破20日均线', symbol="20日均线")
+            # >>> MODIFIED: 将 20/60/90 更改为 10/30/60
+            df_ma10 = self.fetcher.fetch_with_cache(ak.stock_rank_xstp_ths, '向上突破10日均线', symbol="10日均线")
+            df_ma30 = self.fetcher.fetch_with_cache(ak.stock_rank_xstp_ths, '向上突破30日均线', symbol="30日均线")
             df_ma60 = self.fetcher.fetch_with_cache(ak.stock_rank_xstp_ths, '向上突破60日均线', symbol="60日均线")
-            df_ma90 = self.fetcher.fetch_with_cache(ak.stock_rank_xstp_ths, '向上突破90日均线', symbol="90日均线")
+            # <<< MODIFIED END
             ljqs_df_raw = self.fetcher.fetch_with_cache(ak.stock_rank_ljqs_ths, '量价齐升')
             # >> 新增持续放量数据的获取
             cxfl_df_raw = self.fetcher.fetch_continuous_volume_increase()
@@ -1145,14 +1149,21 @@ class StockDataPipeline:
 
             # 使用新的获取方法
             top_industry_cons_df = self.fetcher.get_top_industry_stocks()
-            processed_xstp_df = self.processor.process_and_merge_xstp_data(df_ma20, df_ma60, df_ma90,
+            # >>> MODIFIED: 传入 10日/30日/60日数据
+            processed_xstp_df = self.processor.process_and_merge_xstp_data(df_ma10, df_ma30, df_ma60,
                                                                            spot_data_all)
+            # <<< MODIFIED END
 
             # --- 技术指标计算 ---
             # 合并所有需要进行技术分析的股票代码，只获取一次历史数据
-            all_ta_codes = set(processed_profit_data['股票代码'].tolist())
-            if not processed_xstp_df.empty:
+            # *** 修复 KeyError: '股票代码' 的关键逻辑调整 ***
+            all_ta_codes = set()
+            if not processed_profit_data.empty and '股票代码' in processed_profit_data.columns:
+                all_ta_codes.update(processed_profit_data['股票代码'].tolist())
+            
+            if not processed_xstp_df.empty and '股票代码' in processed_xstp_df.columns:
                 all_ta_codes.update(processed_xstp_df['股票代码'].tolist())
+            # **********************************************
 
             all_ta_codes = [code for code in all_ta_codes if pd.notna(code)]
 
