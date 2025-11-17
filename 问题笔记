@@ -1,16 +1,1 @@
-fund_flow_df = processed_data.get('market_fund_flow_raw', pd.DataFrame())
-        
-        # 检查数据源是否为空且包含必要的列
-        if not fund_flow_df.empty and '股票代码' in fund_flow_df.columns and '资金流入净额' in fund_flow_df.columns:
-            # 1. 提取股票代码和资金流入净额
-            merge_df = fund_flow_df[['股票代码', '资金流入净额']].drop_duplicates(subset=['股票代码'])
-            
-            # 2. 合并到 final_df
-            final_df = pd.merge(final_df, merge_df, on='股票代码', how='left')
-            
-            # 3. 填充 NaN 为 0.0 (资金净额是金额，填充 0.0 更合理)
-            # 确保列名为 '资金流入净额' 且为数值类型
-            final_df['资金流入净额'] = pd.to_numeric(final_df['资金流入净额'], errors='coerce').fillna(0.0)
-        else:
-            # 如果数据源缺失，则创建空列并填充 0.0
-            final_df['资金流入净额'] = 0.0
+https://hybrid.gelonghui.com/stock-check/sz002049
