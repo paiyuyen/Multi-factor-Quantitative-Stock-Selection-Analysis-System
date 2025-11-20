@@ -742,8 +742,7 @@ class StockAnalyzer:
 
         # 3. 合并信号和细节 (以下合并仍然使用股票代码，因为它更可靠)
         # A. 主力研报信号 (使用买入次数)
-        report_df = processed_data['processed_main_report'][['股票代码', '机构投资评级(近六个月)-买入']]
-        report_df.rename(columns={'机构投资评级(近六个月)-买入': '研报买入次数'}, inplace=True)
+        report_df = processed_data['processed_main_report'][['股票代码', '研报买入次数']]
         final_df = pd.merge(final_df, report_df, on='股票代码', how='left')
         final_df['研报买入次数'] = pd.to_numeric(final_df['研报买入次数'], errors='coerce').fillna(0).astype(int)
 
@@ -980,7 +979,7 @@ class StockAnalyzer:
             processed_main_report = raw_data.get('main_report_raw', pd.DataFrame())
             spot_df = raw_data.get('spot_data_all', pd.DataFrame())
 
-            # --- 对主力研报数据进行条件过滤 (买入评级 > 1) ---
+            # --- 对主力研报数据进行条件过滤 (买入评级 >= 1) ---
             report_col = '机构投资评级(近六个月)-买入'
             if not processed_main_report.empty and report_col in processed_main_report.columns:
                 # 确保过滤列是数字类型
@@ -991,8 +990,15 @@ class StockAnalyzer:
             raw_data['processed_main_report'] = processed_main_report # 更新字典中的数据
 
             # 2. 获取并处理历史数据，以便进行技术分析
-            all_codes_for_hist = list(set(spot_df['股票代码'].tolist() + processed_main_report['股票代码'].tolist()))
-            hist_df_all = self._fetch_hist_data_parallel(all_codes_for_hist, days=150) # 150天用于 TA
+            # [核心修改点]: 仅基于过滤后的主力研报数据来下载历史K线
+            all_codes_for_hist = list(processed_main_report['股票代码'].unique())
+            
+            # 如果研报数据为空，则历史数据下载列表也为空，避免下载所有股票
+            if not all_codes_for_hist:
+                 print("[WARN] 主力研报过滤后股票列表为空，跳过历史K线下载。")
+                 hist_df_all = pd.DataFrame()
+            else:
+                 hist_df_all = self._fetch_hist_data_parallel(all_codes_for_hist, days=150) # 150天用于 TA
 
             # 3. 计算技术指标信号
             ta_signals = self._process_ta_signals(all_codes_for_hist, hist_df_all, spot_df)
@@ -1020,14 +1026,14 @@ class StockAnalyzer:
                 '连续上涨': raw_data['consecutive_rise_raw'],
                 '量价齐升': raw_data['ljqs_raw'],
                 '持续放量': raw_data['cxfl_raw'],
-                # [MODIFIED] 替换原有的 MACD 信号表格
+                # [MACD 零轴过滤版本]
                 'MACD_12269_零轴上金叉': ta_signals.get('MACD_12269_零轴上金叉', pd.DataFrame()), 
                 'MACD_12269_零轴下金叉': ta_signals.get('MACD_12269_零轴下金叉', pd.DataFrame()),
                 'MACD_6135_零轴上金叉': ta_signals.get('MACD_6135_零轴上金叉', pd.DataFrame()),
                 'MACD_6135_零轴下金叉': ta_signals.get('MACD_6135_零轴下金叉', pd.DataFrame()),
-                # [END MODIFIED]
+                # [其他 TA 信号]
                 'KDJ超卖金叉': ta_signals.get('KDJ', pd.DataFrame()),
-                'CCI专业状态': ta_signals.get('CCI', pd.DataFrame()), # **改进点：使用专业状态**
+                'CCI专业状态': ta_signals.get('CCI', pd.DataFrame()),
                 'RSI超卖': ta_signals.get('RSI', pd.DataFrame()),
                 'BOLL低波': ta_signals.get('BOLL', pd.DataFrame()),
                 '前十板块成分股': raw_data['top_industry_cons_df'],
