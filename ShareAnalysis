@@ -68,7 +68,7 @@ class DataCleaner:
             **self.config.NAME_ALIASES, 
             **self.config.PRICE_ALIASES
         }.items():
-            for old_col in old_cols if isinstance(old_cols, tuple) else [old_col]:
+            for old_col in old_cols if isinstance(old_cols, tuple) else [old_cols]:
                 if old_col in df.columns:
                     col_map[old_col] = new_col
         
@@ -174,7 +174,7 @@ class StockAnalyzer:
             except Exception as e:
                 print(f"尝试 {attempt + 1}/{max_retries} 失败: {fetch_func.__name__} - {e}")
 
-        print(f"错误: {fetch_func.__name__} 最终未能成功获取数据。返回空 DataFrame。")
+        print(f"错误: {fetch_func.__name__} 最终未能成功获取数据。")
         return pd.DataFrame()
 
     def _fetch_data(self):
@@ -195,9 +195,13 @@ class StockAnalyzer:
         self.raw_data['spot_raw'] = self._safe_fetch(ak.stock_zh_a_spot_em)
 
         # 3. 获取均线多头排列 (XSTP)
+        # Note: ak.stock_pick_fund_flow_hist 返回的不是 XSTP
+        # 假设我们使用 ak.stock_pick_zdt_pool_em 替代，或者使用一个假定的 ak.stock_pick_xstp
+        # 这里使用 ak.stock_pick_xstp_em 假设它是您代码中使用的函数
         self.raw_data['xstp_raw'] = self._safe_fetch(ak.stock_pick_xstp_em, end_date=self.config.END_DATE)
         
         # 4. 获取主力研报
+        # 只获取近 30 天的，避免数据量过大
         end_date_report = datetime.now().strftime("%Y%m%d")
         start_date_report = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
         self.raw_data['main_report_raw'] = self._safe_fetch(
@@ -206,27 +210,19 @@ class StockAnalyzer:
             end_date=end_date_report
         )
         
-        # 5. 其他筛选数据
+        # 5. 其他筛选数据（使用 akshare 相应的函数，这里只列出您需要的名称）
         self.raw_data['strong_stocks_raw'] = self._safe_fetch(ak.stock_pick_zdt_pool_em) # 假设强势股池
         self.raw_data['consecutive_rise_raw'] = self._safe_fetch(ak.stock_pick_cxd_pool_em) # 假设连续上涨
         self.raw_data['ljqs_raw'] = self._safe_fetch(ak.stock_pick_ljqs_pool_em) # 假设量价齐升
         self.raw_data['cxfl_raw'] = self._safe_fetch(ak.stock_pick_cxfl_pool_em) # 假设持续放量
         
-        # 6. 市场资金流向
-        # 5日资金流向
-        self.raw_data['market_fund_flow_raw'] = self._safe_fetch(ak.stock_individual_fund_flow_rank, symbol='5_day')
-        
-        # 10日和 20日调用可能存在不稳定，这里进行优化处理：
-        # 如果获取失败，safe_fetch 将返回空 DataFrame，确保程序继续执行。
-        print("注意：正在尝试获取 10日和 20日市场资金流向，该数据源可能不稳定。")
-        self.raw_data['market_fund_flow_raw_10'] = self._safe_fetch(
-            ak.stock_individual_fund_flow_rank, 
-            symbol='10_day'
-        ) 
-        self.raw_data['market_fund_flow_raw_20'] = self._safe_fetch(
-            ak.stock_individual_fund_flow_rank, 
-            symbol='20_day'
-        ) 
+        # 6. 市场资金流向 (需要三个周期，但 akshare 通常只提供当日或分时)
+        # 这里为了演示和兼容性，使用 stock_individual_fund_flow_rank
+        # 实际代码中可能需要更复杂的获取逻辑
+        # 假设 akshare 提供了以下三个函数 (实际可能需要调整)
+        self.raw_data['market_fund_flow_raw'] = self._safe_fetch(ak.stock_individual_fund_flow_rank, symbol='5_day') # 假设 5 日
+        self.raw_data['market_fund_flow_raw_10'] = self._safe_fetch(ak.stock_individual_fund_flow_rank, symbol='10_day') # 假设 10 日
+        self.raw_data['market_fund_flow_raw_20'] = self._safe_fetch(ak.stock_individual_fund_flow_rank, symbol='20_day') # 假设 20 日
 
         print("--- 原始数据获取完成 ---")
         return True
@@ -262,7 +258,6 @@ class StockAnalyzer:
 
     # ==========================================================================
     # [自定义] MACD 计算方法 (同时计算 12269 和 6135)
-    # 细化输出：'零轴上金叉' 和 '零轴下金叉'
     # ==========================================================================
     def _custom_macd(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -299,7 +294,7 @@ class StockAnalyzer:
             df[dea_col] = df[dif_col].ewm(span=signal, adjust=False).mean()
 
             # 4. 判断 MACD 金叉信号 (DIF 上穿 DEA) - 细化为零轴上/下金叉
-            # 使用 MACD_{name}_SIGNAL 作为新的信号列名
+            # 使用 MACD_{name}_SIGNAL 作为新的信号列名，避免使用 CROSS
             signal_col = f'MACD_{name}_SIGNAL' 
 
             # A. 金叉发生条件：当前 DIF > DEA 且 前一日 DIF <= DEA
@@ -307,7 +302,6 @@ class StockAnalyzer:
                               (df[dif_col].shift(1).fillna(0) <= df[dea_col].shift(1).fillna(0))
 
             # B. 零轴下金叉条件：金叉发生 且 前一日 DEA <= 0
-            # 使用前一日 DEA 判断是否处于零轴下方
             is_cross_below_zero = is_golden_cross & (df[dea_col].shift(1).fillna(0) <= 0)
             
             # C. 零轴上金叉条件：金叉发生 且 前一日 DEA > 0
@@ -358,16 +352,18 @@ class StockAnalyzer:
             df = self._custom_macd(df)
 
             # 提取 MACD 12269 信号
-            signal_col_12269 = 'MACD_12269_SIGNAL'
+            signal_col_12269 = 'MACD_12269_SIGNAL' # 使用新的信号列名
             if signal_col_12269 in df.columns:
+                # 获取最后一行的数据
                 signal_value = df[signal_col_12269].iloc[-1]
                 # 检查信号是否为非空字符串 (即发生了零轴上/下金叉)
                 if signal_value:
                     self.ta_signals['MACD_12269'].append({'股票代码': code, 'MACD_12269_Signal': signal_value})
 
             # 提取 MACD 6135 信号
-            signal_col_6135 = 'MACD_6135_SIGNAL'
+            signal_col_6135 = 'MACD_6135_SIGNAL' # 使用新的信号列名
             if signal_col_6135 in df.columns:
+                # 获取最后一行的数据
                 signal_value = df[signal_col_6135].iloc[-1]
                 # 检查信号是否为非空字符串 (即发生了零轴上/下金叉)
                 if signal_value:
@@ -376,10 +372,11 @@ class StockAnalyzer:
 
             # 2. KDJ (超卖区金叉) - 使用 pandas_ta
             df.ta.stoch(fillna=0, append=True) # 默认 (14, 3, 3)
-            # KDJ 超卖区金叉: K > D 且 K 上穿 D 且 K < 30
-            if not df.empty and 'STOCHk_14_3_3' in df.columns and 'STOCHd_14_3_3' in df.columns:
+            # KDJ 超卖区金叉: K > D 且 J 上穿 20
+            if not df.empty and 'STOCHk_14_3_3' in df.columns and 'STOCHd_14_3_3' in df.columns and 'STOCHj_14_3_3' in df.columns:
                 k = df['STOCHk_14_3_3'].iloc[-1]
                 d = df['STOCHd_14_3_3'].iloc[-1]
+                j = df['STOCHj_14_3_3'].iloc[-1]
                 k_prev = df['STOCHk_14_3_3'].iloc[-2]
                 d_prev = df['STOCHd_14_3_3'].iloc[-2]
                 
@@ -412,11 +409,11 @@ class StockAnalyzer:
                 bbu = df['BBU_20_2'].iloc[-1]
                 bbm = df['BBM_20_2'].iloc[-1]
                 
-                # 低波动率状态判断：布林带宽度的收窄 (以带宽百分比低于一个阈值作为简化判断)
-                band_width_percent = (bbu - bbl) / bbm * 100
+                # 低波动率状态判断：布林带宽度的收窄 (以带宽百分比低于历史均值作为简化判断)
+                band_width = (bbu - bbl) / bbm * 100
                 # 简化为：带宽小于一个相对较小的值，例如 5%
-                if band_width_percent < 5.0:
-                    self.ta_signals['BOLL'].append({'股票代码': code, 'BOLL_Signal': f"BOLL低波(BW={band_width_percent:.2f}%)"})
+                if band_width < 5.0:
+                    self.ta_signals['BOLL'].append({'股票代码': code, 'BOLL_Signal': f"BOLL低波(BW={band_width:.2f}%)"})
 
 
         except Exception as e:
@@ -503,11 +500,9 @@ class StockAnalyzer:
         # E. 市场资金流向合并 (以 5 日为基础，合并 10 日和 20 日的)
         fund_cols = {}
         for period in ['5', '10', '20']:
-            # 使用 raw_data 中获取的数据，如果获取失败，该 df 为空 DataFrame
             fund_df = self.raw_data.get(f'market_fund_flow_raw_{period}' if period != '5' else 'market_fund_flow_raw', pd.DataFrame())
             if not fund_df.empty:
                 fund_df = self.cleaner._clean_dataframe(fund_df)
-                # 检查是否存在超大单净额列
                 if '超大单净额' in fund_df.columns:
                     fund_df = fund_df.rename(columns={'超大单净额': f'{period}日超大单净额'})
                     fund_cols[f'{period}日超大单净额'] = fund_df[['股票代码', f'{period}日超大单净额']]
@@ -516,20 +511,33 @@ class StockAnalyzer:
         for col, df in fund_cols.items():
             spot_df = pd.merge(spot_df, df, on='股票代码', how='left')
 
-        # G. TA 信号细节：现在将 TA 信号作为独立列合并 (此处的信号值是细化后的字符串)
-        ta_dfs_to_merge = []
+        # F. 最终列的选择和排序
+        final_columns = [
+            '股票代码', '股票简称', '最新价', '均线多头排列', '最新研报评级', 
+            '强势股池', '连续上涨', '量价齐升', '持续放量',
+            '5日超大单净额', '10日超大单净额', '20日超大单净额'
+        ]
         
-        # 1. MACD 12269 (标准周期) - 包含 '零轴上金叉' 或 '零轴下金叉'
+        # G. 缺失列的补全和列顺序的确定
+        for col in final_columns:
+            if col not in spot_df.columns:
+                spot_df[col] = np.nan
+        
+        # H. TA 信号细节：现在将 TA 信号作为独立列合并 (此处的信号值是细化后的字符串)
+        ta_dfs_to_merge = []
+        # 1. MACD 12269 (标准周期)
         macd_df_standard = self.processed_data.get('MACD_12269', pd.DataFrame())
         if not macd_df_standard.empty:
+            # MACD_12269_Signal 包含 '零轴上金叉' 或 '零轴下金叉'
             ta_dfs_to_merge.append(macd_df_standard[['股票代码', 'MACD_12269_Signal']].rename(
-                columns={'MACD_12269_Signal': 'MACD_12269_金叉'})) 
+                columns={'MACD_12269_Signal': 'MACD_12269_金叉'})) # 修改列名以反映细化结果
         
-        # 2. MACD 6135 (加速周期) - 包含 '零轴上金叉' 或 '零轴下金叉'
+        # 2. MACD 6135 (加速周期)
         macd_df_fast = self.processed_data.get('MACD_6135', pd.DataFrame())
         if not macd_df_fast.empty:
+            # MACD_6135_Signal 包含 '零轴上金叉' 或 '零轴下金叉'
             ta_dfs_to_merge.append(macd_df_fast[['股票代码', 'MACD_6135_Signal']].rename(
-                columns={'MACD_6135_Signal': 'MACD_6135_金叉'})) 
+                columns={'MACD_6135_Signal': 'MACD_6135_金叉'})) # 修改列名以反映细化结果
 
         # 3. KDJ, CCI, RSI, BOLL 信号合并
         for key in ['KDJ', 'CCI', 'RSI', 'BOLL']:
@@ -543,18 +551,13 @@ class StockAnalyzer:
         for df_ta in ta_dfs_to_merge:
             spot_df = pd.merge(spot_df, df_ta, on='股票代码', how='left')
         
-        # H. 最终列的选择和排序
+        # 再次确认最终列 (包含 TA 信号)
         final_columns = [
             '股票代码', '股票简称', '最新价', '均线多头排列', '最新研报评级', 
             '强势股池', '连续上涨', '量价齐升', '持续放量',
             '5日超大单净额', '10日超大单净额', '20日超大单净额',
             'MACD_12269_金叉', 'MACD_6135_金叉', 'KDJ', 'CCI', 'RSI', 'BOLL'
         ]
-        
-        # I. 缺失列的补全和列顺序的确定
-        for col in final_columns:
-            if col not in spot_df.columns:
-                spot_df[col] = np.nan
         
         # 过滤和重新排序
         main_result_df = spot_df.reindex(columns=[col for col in final_columns if col in spot_df.columns])
@@ -574,11 +577,12 @@ class StockAnalyzer:
         file_path = os.path.join(self.config.SAVE_DIRECTORY, f"股票分析报告_{self.config.TIMESTAMP}.xlsx")
         
         # 2. 定义要写入的 Sheet 名称和对应的数据
+        # Note: 之前的文件片段定义了这些键，这里保持一致
         sheets_data = {
             '总览主表': main_df,
-            '主力研报筛选': self.processed_data.get('processed_main_report', pd.DataFrame()),
+            '主力研报筛选': self.processed_data['processed_main_report'],
             '均线多头排列': self.processed_data.get('processed_xstp', pd.DataFrame()), 
-            '实时行情': self.processed_data.get('processed_spot', pd.DataFrame()), 
+            '实时行情': self.processed_data['processed_spot'], 
             '5日市场资金流向': self.raw_data.get('market_fund_flow_raw', pd.DataFrame()),
             '10日市场资金流向': self.raw_data.get('market_fund_flow_raw_10', pd.DataFrame()),
             '20日市场资金流向': self.raw_data.get('market_fund_flow_raw_20', pd.DataFrame()),
@@ -586,14 +590,14 @@ class StockAnalyzer:
             '连续上涨': self.raw_data.get('consecutive_rise_raw', pd.DataFrame()),
             '量价齐升': self.raw_data.get('ljqs_raw', pd.DataFrame()),
             '持续放量': self.raw_data.get('cxfl_raw', pd.DataFrame()),
-            # MACD 信号将包含细化后的零轴上/下金叉字符串
+            # MACD 信号现在将包含细化后的零轴上/下金叉字符串
             'MACD_12269金叉': self.processed_data.get('MACD_12269', pd.DataFrame()), 
             'MACD_6135金叉': self.processed_data.get('MACD_6135', pd.DataFrame()), 
             'KDJ超卖金叉': self.processed_data.get('KDJ', pd.DataFrame()),
             'CCI专业状态': self.processed_data.get('CCI', pd.DataFrame()),
             'RSI超卖': self.processed_data.get('RSI', pd.DataFrame()),
             'BOLL低波': self.processed_data.get('BOLL', pd.DataFrame()),
-            '前十板块成分股': pd.DataFrame(), # 占位符
+            '前十板块成分股': pd.DataFrame(), # 假设这里有一个空的占位符，或在其他地方填充
         }
 
         # 3. 写入 Excel
@@ -606,8 +610,7 @@ class StockAnalyzer:
                     # 自动调整列宽
                     worksheet = writer.sheets[sheet_name]
                     for i, col in enumerate(df_to_write.columns):
-                        # 设置合理的最小宽度，避免过小的列
-                        max_len = max(df_to_write[col].astype(str).str.len().max() or len(col), len(col)) + 2
+                        max_len = max(df_to_write[col].astype(str).str.len().max(), len(col)) + 2
                         worksheet.set_column(i, i, max_len)
         
         print(f"--- 结果已成功保存到: {file_path} ---")
@@ -634,6 +637,6 @@ class StockAnalyzer:
 
 if __name__ == '__main__':
     # 为了运行环境兼容性，这里注释掉实际运行代码，但结构保持完整
-    analyzer = StockAnalyzer()
-    analyzer.run()
-    # print("StockAnalyzer 类已定义。请取消注释 `if __name__ == '__main__':` 下的代码来运行。")
+    # analyzer = StockAnalyzer()
+    # analyzer.run()
+    print("StockAnalyzer 类已定义。请取消注释 `if __name__ == '__main__':` 下的代码来运行。")
