@@ -417,6 +417,42 @@ class StockAnalyzer:
 
         return df
 
+
+# ==========================================================================
+    # [新增] MACD 动能状态计算辅助函数 (源自 1.py)
+    # ==========================================================================
+    def _calculate_macd_momentum(self, df: pd.DataFrame, dif_col: str, dea_col: str) -> str:
+        """
+        计算 MACD 动能状态: 加速上涨/减速上涨/加速下跌/减速下跌
+        """
+        if len(df) < 2:
+            return "N/A (数据不足)"
+
+        # 获取最新的 DIF, DEA 值和前一天的 DIF 值
+        latest_dif = df[dif_col].iloc[-1]
+        latest_dea = df[dea_col].iloc[-1]
+        prev_dif = df[dif_col].iloc[-2]
+
+        # DIF 线的变化 (MACD 柱的变化方向)
+        dif_change = latest_dif - prev_dif
+
+        momentum_state = ""
+
+        if latest_dif >= latest_dea:
+            # DIF 在 DEA 之上 (多头区域/红柱)
+            if dif_change > 0:
+                momentum_state = "加速上涨 (红柱加长)"
+            elif dif_change <= 0:
+                momentum_state = "减速上涨 (红柱缩短)"
+        else:
+            # DIF 在 DEA 之下 (空头区域/绿柱)
+            if dif_change < 0:
+                momentum_state = "加速下跌 (绿柱加长)"
+            elif dif_change >= 0:
+                momentum_state = "减速下跌 (绿柱缩短)"
+
+        return momentum_state
+
     # ==========================================================================
     # [新增/改进] CCI 专业化分类函数
     # ==========================================================================
@@ -482,7 +518,9 @@ class StockAnalyzer:
         print(f"\n正在对 {len(all_codes)} 只股票进行技术分析...")
 
         # MACD指标增加两种周期，键名不变，但内容将包含零轴信息
-        ta_signals = {'MACD_12269': [], 'MACD_6135': [], 'KDJ': [], 'CCI': [], 'RSI': [], 'BOLL': []}
+        # MACD指标增加两种周期，键名不变，但内容将包含零轴信息
+        ta_signals = {'MACD_12269': [], 'MACD_6135': [], 'KDJ': [], 'CCI': [], 'RSI': [], 'BOLL': [], 
+                      'MACD_DIF_MOMENTUM': []} # <== 新增这一项
 
         if hist_df_all.empty:
             print("[WARN] 历史数据为空，跳过技术分析。")
@@ -513,8 +551,26 @@ class StockAnalyzer:
                 continue
 
             try:
-                # 1. MACD (金叉) - **计算并提取两种周期的信号**
+               
                 df = self._custom_macd(df)
+
+                try:
+                    latest_row = df.iloc[-1]
+                    # 计算标准周期动能
+                    mom_12269 = self._calculate_macd_momentum(df, 'DIF_12269', 'DEA_12269')
+                    # 计算加速周期动能
+                    mom_6135 = self._calculate_macd_momentum(df, 'DIF_6135', 'DEA_6135')
+                    
+                    ta_signals['MACD_DIF_MOMENTUM'].append({
+                        '股票代码': code,
+                        'MACD_12269_DIF': latest_row.get('DIF_12269', 0),
+                        'MACD_12269_动能': mom_12269,
+                        'MACD_6135_DIF': latest_row.get('DIF_6135', 0),
+                        'MACD_6135_动能': mom_6135,
+                    })
+                except Exception as e:
+                    print(f"[WARN] {code} 动能计算失败: {e}")
+                
 
                 # 提取 MACD 12269 信号 (使用新的详细列)
                 detail_col_12269 = 'MACD_12269_SIGNAL_DETAIL'
@@ -945,6 +1001,19 @@ class StockAnalyzer:
         # 将所有 TA 信号合并到 final_df
         for ta_df in ta_dfs_to_merge:
             final_df = pd.merge(final_df, ta_df.drop_duplicates(subset=['股票代码']), on='股票代码', how='left')
+            
+
+        # 合并 MACD 动能状态数据
+
+        momentum_df = processed_data.get('MACD_DIF_MOMENTUM', pd.DataFrame())
+        if not momentum_df.empty and '股票代码' in momentum_df.columns:
+            # 动能数据本身不作为过滤条件，直接 Left Join
+            final_df = pd.merge(final_df, momentum_df, on='股票代码', how='left')
+            # 填充空值
+            for col in ['MACD_12269_动能', 'MACD_6135_动能']:
+                if col in final_df.columns:
+                    final_df[col] = final_df[col].fillna('')
+
 
         # 对新的 TA 信号列填充空值
         for col in ['MACD_12269', 'MACD_6135', 'KDJ_Signal', 'CCI_Signal', 'RSI_Signal', 'BOLL_Signal']:
@@ -987,9 +1056,12 @@ class StockAnalyzer:
 
         # 最终列顺序 (手动调整，确保最重要的信息在前)
         base_cols = ['序号', '股票代码', '股票简称', '最新价']
+        
         signal_cols = [
             '强势股', '量价齐升', '连涨天数', '放量天数',
-            'MACD_12269', 'MACD_6135', 'KDJ_Signal', 'CCI_Signal', 'RSI_Signal', 'BOLL_Signal',
+            'MACD_12269', 'MACD_12269_动能', 'MACD_12269_DIF', # <== 新增
+            'MACD_6135', 'MACD_6135_动能', 'MACD_6135_DIF',    # <== 新增
+            'KDJ_Signal', 'CCI_Signal', 'RSI_Signal', 'BOLL_Signal',
         ]
         report_cols = [
             '研报买入次数', '完全多头排列', '10日均线最新价', '30日均线最新价', '60日均线最新价',
@@ -1162,8 +1234,9 @@ class StockAnalyzer:
                 '连续上涨': raw_data['consecutive_rise_raw'],
                 '量价齐升': raw_data['ljqs_raw'],
                 '持续放量': raw_data['cxfl_raw'],
-                'MACD_12269金叉': ta_signals.get('MACD_12269', pd.DataFrame()),  # 增加标准周期表格
-                'MACD_6135金叉': ta_signals.get('MACD_6135', pd.DataFrame()),  # 增加加速周期表格
+                'MACD_12269金叉': ta_signals.get('MACD_12269', pd.DataFrame()),
+                'MACD_6135金叉': ta_signals.get('MACD_6135', pd.DataFrame()),
+                'MACD_DIF_动能状态': ta_signals.get('MACD_DIF_MOMENTUM', pd.DataFrame()), # <== 新增这一行
                 'KDJ超卖金叉': ta_signals.get('KDJ', pd.DataFrame()),
                 'CCI专业状态': ta_signals.get('CCI', pd.DataFrame()),  # **改进点：使用专业状态**
                 'RSI超卖': ta_signals.get('RSI', pd.DataFrame()),
