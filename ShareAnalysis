@@ -47,14 +47,12 @@ def format_stock_code(code: str) -> str:
         return 'bj' + code_str
     return code_str
 
-
 # ==============================================================================
 # 核心分析类 (集成 Fetching, Processing, Reporting)
 # ==============================================================================
 class StockAnalyzer:
-    """
-    股票数据获取、处理、分析和报告生成的核心类。
-    """
+
+
 
     def __init__(self):
         self.config = Config()
@@ -533,22 +531,77 @@ class StockAnalyzer:
                         ta_signals['MACD_6135'].append({'股票代码': code, 'MACD_6135_Signal': signal_detail})
                 # --- MACD 自定义计算结束 ---
 
-                # 2. KDJ (超卖区金叉) - 使用 pandas_ta
-                df.ta.stoch(append=True, close='close', high='high', low='low')
-                kdj_cols = [col for col in df.columns if col.startswith('STOCHk_') or col.startswith('STOCHd_')]
-                if len(kdj_cols) >= 2:
-                    k_col = kdj_cols[0]
-                    d_col = kdj_cols[1]
-                    # K<20 区域
-                    df['KDJ_OVS'] = np.where((df[k_col] < 20) & (df[d_col] < 20), 1, 0)
-                    # 金叉
-                    df['KDJ_CROSS'] = np.where(
-                        (df[k_col] > df[d_col]) & (df[k_col].shift(1) <= df[d_col].shift(1)), 1, 0)
 
-                    # 超卖区金叉
-                    if df['KDJ_OVS'].iloc[-5:-1].sum() > 0 and df['KDJ_CROSS'].iloc[-1] == 1:
-                        # 仅记录信号，不包含评分
-                        ta_signals['KDJ'].append({'股票代码': code, 'KDJ_Signal': '超卖区金叉'})
+                        # 2. KDJ 增强版 (集成 J值、背离、趋势过滤)
+
+
+                        df.ta.stoch(append=True, close='close', high='high', low='low')
+                        kdj_cols = [col for col in df.columns if col.startswith('STOCHk_') or col.startswith('STOCHd_')]
+
+                        if len(kdj_cols) >= 2:
+                            k_col = kdj_cols[0]
+                            d_col = kdj_cols[1]
+                            j_col = 'KDJ_J'
+
+                            # 1. 手动计算 J 值: J = 3K - 2D
+                            df[j_col] = 3 * df[k_col] - 2 * df[d_col]
+
+                            # 2. 定义基础状态
+                            # 金叉：K上穿D
+                            kdj_cross = (df[k_col] > df[d_col]) & (df[k_col].shift(1) <= df[d_col].shift(1))
+                            # 极度超卖：J值曾在过去3天内小于 0
+                            j_oversold = df[j_col].shift(1).rolling(window=3).min() < 0
+                            # 普通超卖：K和D都在20以下
+                            kd_oversold = (df[k_col] < 20) & (df[d_col] < 20)
+
+                            # 3. 定义高级信号：底背离 (Divergence)
+                            # 逻辑：价格(Low)创最近10天新低，但K值没有创最近10天新低
+                            # 简化算法：当前是金叉点，且价格低于前一个金叉点，但K值高于前一个金叉点 (这里用简化窗口法)
+                            window = 10
+                            curr_low = df['low'].iloc[-1]
+                            min_low_window = df['low'].iloc[-window:-1].min()
+                            curr_k = df[k_col].iloc[-1]
+                            min_k_window = df[k_col].iloc[-window:-1].min()
+
+                            # 背离判断：当前价格接近窗口最低价，但K值明显高于窗口最低K值
+                            is_divergence = (curr_low <= min_low_window * 1.02) & (curr_k > min_k_window * 1.1)
+
+                            # 4. 辅助过滤：股价站上5日线 (右侧确认)
+                            ma5 = df['close'].rolling(window=5).mean()
+                            above_ma5 = df['close'] > ma5
+
+                            # --- 信号提取逻辑 ---
+                            current_idx = df.index[-1]  # 最后一行的索引
+                            last_row = df.iloc[-1]
+                            prev_row = df.iloc[-2]
+
+                            signal_msg = ""
+
+                            # 场景 A: 极值 J 线反转 (最强短线信号)
+                            # 条件：昨日 J < 0, 今日 J > 5, 且今日金叉
+                            if prev_row[j_col] < 0 and last_row[j_col] > 5 and kdj_cross.iloc[-1]:
+                                signal_msg = "极值J线反转"
+
+                            # 场景 B: 底背离金叉 (波段反转信号)
+                            # 条件：金叉 + 判定背离 + K<30 (低位)
+                            elif kdj_cross.iloc[-1] and is_divergence and last_row[k_col] < 30:
+                                signal_msg = "底背离金叉"
+
+                            # 场景 C: 超卖区金叉 + 趋势确认 (稳健信号)
+                            # 条件：最近5天有过超卖 + 金叉 + 站上5日线
+                            elif (kd_oversold.iloc[-5:-1].sum() > 0) and kdj_cross.iloc[-1] and above_ma5.iloc[-1]:
+                                signal_msg = "趋势确认金叉"
+
+                            # 场景 D: 普通低位金叉 (保留原有逻辑作为兜底)
+                            elif (kd_oversold.iloc[-5:-1].sum() > 0) and kdj_cross.iloc[-1]:
+                                signal_msg = "低位超卖金叉"
+
+                            # 如果有信号，则记录
+                            if signal_msg:
+                                ta_signals['KDJ'].append({
+                                    '股票代码': code,
+                                    'KDJ_Signal': f"{signal_msg} (K={last_row[k_col]:.1f}, J={last_row[j_col]:.1f})"
+                                })
 
                 # 3. CCI (专业分类) - 使用 pandas_ta
                 df.ta.cci(append=True, close='close', high='high', low='low')
