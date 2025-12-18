@@ -766,9 +766,7 @@ class StockAnalyzer:
         filtered_df.rename(columns={'最新价': '当前价格'}, inplace=True)
         return filtered_df.fillna('N/A')
 
-    # ==========================================================================
-    # [修改] _consolidate_data: 确保 MACD 详细信号的列名
-    # ==========================================================================
+
     def _consolidate_data(self, processed_data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         """合并所有数据源和信号，生成最终汇总报告。"""
         print("\n>>> 正在汇总所有数据和信号 (技术指标作为独立列)...")
@@ -955,7 +953,6 @@ class StockAnalyzer:
 
         final_df['放量天数'] = final_df['放量天数'].astype(int)
 
-        # H. TA 信号细节：现在将 TA 信号作为独立列合并
 
         ta_dfs_to_merge = []
 
@@ -1022,7 +1019,12 @@ class StockAnalyzer:
             else:
                 # 如果某个信号源为空，则补充空列以保持一致性
                 final_df[col] = ''
-
+        top_ind_df = processed_data.get('top_industry_cons_df', pd.DataFrame())
+        if not top_ind_df.empty:
+            top_codes = set(top_ind_df['股票代码'].astype(str).unique())
+            final_df['TOP10行业']= final_df['股票代码'].apply(lambda x:'是' if str(x) in top_codes else '否')
+        else:
+            final_df['TOP10行业'] = '否'
         # 4. 过滤掉没有任何主要信号的股票
         def has_any_signal(row):
             # 这里的研报买入次数列在 run() 方法中已过滤，且在 merge 填充 NaN 为 0，故此处检查 > 0 即可
@@ -1030,6 +1032,7 @@ class StockAnalyzer:
                     row['完全多头排列'] == '是' or
                     row['强势股'] == '是' or
                     row['量价齐升'] == '是' or
+                    row.get('TOP10行业') == '是' or
                     row['MACD_12269'] != '' or
                     row['MACD_6135'] != '' or
                     row['KDJ_Signal'] != '' or
@@ -1058,7 +1061,7 @@ class StockAnalyzer:
         base_cols = ['序号', '股票代码', '股票简称', '最新价']
 
         signal_cols = [
-            '强势股', '量价齐升', '连涨天数', '放量天数',
+            '强势股', '量价齐升', '连涨天数', '放量天数','TOP10行业',
             'MACD_12269', 'MACD_12269_动能', 'MACD_12269_DIF',  # <== 新增
             'MACD_6135', 'MACD_6135_动能', 'MACD_6135_DIF',  # <== 新增
             'KDJ_Signal', 'CCI_Signal', 'RSI_Signal', 'BOLL_Signal',
@@ -1125,15 +1128,6 @@ class StockAnalyzer:
         """主运行方法。"""
         print(f"股票分析程序启动 (Today: {self.today_str})")
 
-        # 清理旧的临时文件 (只清理当日文件以外的)
-        for filename in os.listdir(self.temp_dir):
-            if not filename.endswith(f"{self.today_str}.txt"):
-                try:
-                    os.remove(os.path.join(self.temp_dir, filename))
-                except Exception:
-                    pass
-        print("旧的临时数据文件清理完成。")
-
         try:
             # 1. 获取所有原始数据
             raw_data = self._get_all_raw_data()
@@ -1142,7 +1136,6 @@ class StockAnalyzer:
             processed_main_report = raw_data.get('main_report_raw', pd.DataFrame())
             spot_df = raw_data.get('spot_data_all', pd.DataFrame())
 
-            # --- 对主力研报数据进行条件过滤 (买入评级 > 1) ---
             report_col = '机构投资评级(近六个月)-买入'
             if not processed_main_report.empty and report_col in processed_main_report.columns:
                 # 确保过滤列是数字类型
@@ -1157,17 +1150,19 @@ class StockAnalyzer:
                 else:
                     print(">>> 主力研报数据已过滤，仅保留 '买入' 评级 > 1 的股票。")
 
-            # --- 核心筛选逻辑：基于过滤后的主力研报股票列表 ---
             if not processed_main_report.empty and '股票代码' in processed_main_report.columns:
                 # 使用过滤后的列表作为分析基础
                 all_codes = set(processed_main_report['股票代码'].unique())
             elif not spot_df.empty and '股票代码' in spot_df.columns:
                 print("[WARN] 主力研报数据为空或无效，回退至使用【A股实时行情】中的股票作为分析基础。")
-                # 使用实时行情中有效的股票代码进行分析
+
                 all_codes = set(spot_df['股票代码'].unique())
             else:
                 print("[FATAL] 无法获取有效的股票代码列表，流程终止。")
                 return
+            top_ind_df = raw_data.get('top_industry_raw', pd.DataFrame())
+            if not top_ind_df.empty:
+                all_codes.update(top_ind_df['股票代码'].astype(str).unique())
 
             filtered_codes_list = list(all_codes)
 
