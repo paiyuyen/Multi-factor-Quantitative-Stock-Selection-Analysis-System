@@ -320,7 +320,7 @@ class StockAnalyzer:
         end_date_str = end_date.strftime("%Y%m%d")
 
         # 缓存文件名增加代码数量和 "_经清洗" 后缀
-        cache_name = f"MACD_hist_data_cache"
+        cache_name = f"Hist_data_cache"
         file_path = self._get_file_path(cache_name, cleaned=True)
         cached_df = self._load_data_from_cache(file_path)
 
@@ -708,16 +708,24 @@ class StockAnalyzer:
                             {'股票代码': code, 'CCI_Signal': cci_signal})
 
                 # 4. RSI (超卖低位) - 使用 pandas_ta
-                df.ta.rsi(append=True, close='close')
+                df.ta.rsi(append=True, close='close', length=14)
                 rsi_cols = [col for col in df.columns if col.startswith('RSI_')]
                 if rsi_cols:
                     rsi_col = rsi_cols[0]
-                    if df[rsi_col].iloc[-1] < 30:
-                        # 仅记录信号，不包含评分
-                        ta_signals['RSI'].append(
-                            {'股票代码': code, 'RSI_Signal': f"超卖低位 ({df[rsi_col].iloc[-1]:.2f})"})
+                    curr_rsi = df[rsi_col].iloc[-1]
+                    window = 10
+                    curr_low = df['low'].iloc[-1]
+                    min_low_window = df['low'].iloc[-window:-1].min()
+                    min_rsi_window = df[rsi_col].iloc[-window:-1].min()
+                    is_price_low = curr_low <= (min_low_window * 1.02)
+                    is_rsi_divergence = (is_price_low) and \
+                                        (curr_rsi > min_rsi_window * 1.05) and \
+                                        (curr_rsi < 50)
+                    if is_rsi_divergence:
+                        ta_signals['RSI'].append({'股票代码': code,
+                                                  'RSI_Signal': f"RSI底背离 (Price低={curr_low}, RSI={curr_rsi:.1f}, 前RSI低={min_rsi_window:.1f})"})
 
-                # 5. BOLL (低波/缩口) - 使用 pandas_ta
+                    # 5. BOLL (低波/缩口) - 使用 pandas_ta
                 df.ta.bbands(append=True, length=20, std=2, close='close')
                 boll_cols = [col for col in df.columns if col.startswith('BBL_')]
                 if boll_cols:
