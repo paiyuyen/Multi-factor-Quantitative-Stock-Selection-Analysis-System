@@ -1,7 +1,7 @@
 <p align="center">
   <img src="https://github.com/paiyuyen/Multi-factor-Quantitative-Stock-Selection-Analysis-System/raw/main/Images/logo.png" alt="LOGO" width="50%">
   <br>
-  <b>BAISYS 多因子量化A股分析报告</b>
+  <h3>BAISYS 多因子A股量化分析报告</h3>
 </p>
 
 #2025年回望与2026年产品打磨规划
@@ -19,7 +19,7 @@
 
 
 
-#🚀 A 股多因子技术分析与报告生成工具
+#🚀 产品必读手册
 
 ##📖 项目简介
 这是一个基于 Python 的 A 股自动化筛选与报告生成工具。它利用 Akshare 库获取实时行情、研报、资金流向等多维度数据，并集成了多种技术分析指标（如双周期 MACD、KDJ、RSI 等）。程序通过多线程高效处理和整合信号，最终生成一份结构清晰、格式专业的 Excel 报告，帮助用户快速锁定具备潜在投资价值的股票。
