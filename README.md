@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://github.com/paiyuyen/Multi-factor-Quantitative-Stock-Selection-Analysis-System/blob/main/Images/logo.png" alt="LOGO">
+</p>
+
 #2025年回望与2026年产品打磨规划
 
 2025年，我个人认为是市场触底反弹迎来疫情及中美大战后的第一个牛市，我一个不懂炒股的刚入门的小白能赚到一些零花钱，我认为这是市场让我赚取的。但是牛市和熊市都是风险与机遇并存。
