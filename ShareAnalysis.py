@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Dict, Any, List
 import numpy as np
 import ParallelUtils as  utils
+import pandas_ta as ta
 
 
 class Config:
@@ -513,8 +514,7 @@ class StockAnalyzer:
         """计算并提取所有技术指标信号。"""
         print(f"\n正在对 {len(all_codes)} 只股票进行技术分析...")
 
-        # MACD指标增加两种周期，键名不变，但内容将包含零轴信息
-        # MACD指标增加两种周期，键名不变，但内容将包含零轴信息
+
         ta_signals = {'MACD_12269': [], 'MACD_6135': [], 'KDJ': [], 'CCI': [], 'RSI': [], 'BOLL': [],
                       'MACD_DIF_MOMENTUM': []}  # <== 新增这一项
 
@@ -546,153 +546,117 @@ class StockAnalyzer:
                 print(f"[ERROR] 股票 {code}: 历史数据中缺少必要的 OHLC 列，跳过 TA 计算。")
                 continue
 
+            df = self._custom_macd(df)
             try:
-                # === [新增] 量比计算与过滤逻辑 ===
-                # 计算 5 日均量（不含当日）
-                df['vol_ma5'] = df['volume'].rolling(window=5).mean().shift(1)
-
-                curr_vol = df['volume'].iloc[-1]
-                prev_vol_ma5 = df['vol_ma5'].iloc[-1]
-
-                # 计算今日涨跌幅 (用于过滤)
-                curr_pct_change = (df['close'].iloc[-1] / df['close'].iloc[-2] - 1) if len(df) > 1 else 0
-
-                # 计算量比数值
-                vol_ratio = 1.0 if pd.isna(prev_vol_ma5) or prev_vol_ma5 == 0 else curr_vol / prev_vol_ma5
-
-                # 判定状态标签
-                vol_status = "缩量" if vol_ratio < 0.8 else "温和" if vol_ratio < 1.5 else "放量"
-                if vol_ratio > 2.5: vol_status = "巨量"
-
-                # 【核心过滤】：如果股价上涨 且 量比 < 0.7 (严重无量上涨)，剔除该股
-                if curr_pct_change > 0 and vol_ratio < 0.7:
-                    continue  # 关键点：直接跳过，不参与后续计算，不计入报表
-
-
-                # === [量比逻辑结束] ===
-                df = self._custom_macd(df)
-
-                try:
-                    latest_row = df.iloc[-1]
+                latest_row = df.iloc[-1]
                     # 计算标准周期动能
-                    mom_12269 = self._calculate_macd_momentum(df, 'DIF_12269', 'DEA_12269')
+                mom_12269 = self._calculate_macd_momentum(df, 'DIF_12269', 'DEA_12269')
                     # 计算加速周期动能
-                    mom_6135 = self._calculate_macd_momentum(df, 'DIF_6135', 'DEA_6135')
+                mom_6135 = self._calculate_macd_momentum(df, 'DIF_6135', 'DEA_6135')
 
-                    ta_signals['MACD_DIF_MOMENTUM'].append({
+                ta_signals['MACD_DIF_MOMENTUM'].append({
                         '股票代码': code,
                         'MACD_12269_DIF': latest_row.get('DIF_12269', 0),
                         'MACD_12269_动能': mom_12269,
                         'MACD_6135_DIF': latest_row.get('DIF_6135', 0),
                         'MACD_6135_动能': mom_6135,
-                    })
-                except Exception as e:
+                     })
+            except Exception as e:
                     print(f"[WARN] {code} 动能计算失败: {e}")
 
-                # 提取 MACD 12269 信号 (使用新的详细列)
-                detail_col_12269 = 'MACD_12269_SIGNAL_DETAIL'
-                if detail_col_12269 in df.columns:
-                    signal_detail = df[detail_col_12269].iloc[-1]
-                    if signal_detail != '':
-                        ta_signals['MACD_12269'].append({'股票代码': code, 'MACD_12269_Signal': signal_detail})
+            # 提取 MACD 12269 信号
+            detail_col_12269 = 'MACD_12269_SIGNAL_DETAIL'
+            if detail_col_12269 in df.columns:
+                signal_detail = df[detail_col_12269].iloc[-1]
+                if signal_detail != '':
+                  ta_signals['MACD_12269'].append({'股票代码': code, 'MACD_12269_Signal': signal_detail})
 
-                # 提取 MACD 6135 信号 (使用新的详细列)
-                detail_col_6135 = 'MACD_6135_SIGNAL_DETAIL'
-                if detail_col_6135 in df.columns:
-                    signal_detail = df[detail_col_6135].iloc[-1]
-                    if signal_detail != '':
-                        ta_signals['MACD_6135'].append({'股票代码': code, 'MACD_6135_Signal': signal_detail})
-                        # --- MACD 自定义计算结束 ---
+                # 提取 MACD 6135 信号
+            detail_col_6135 = 'MACD_6135_SIGNAL_DETAIL'
+            if detail_col_6135 in df.columns:
+                signal_detail = df[detail_col_6135].iloc[-1]
+                if signal_detail != '':
+                  ta_signals['MACD_6135'].append({'股票代码': code, 'MACD_6135_Signal': signal_detail})
 
-                        # 2. KDJ 增强版 (集成 J值、背离、趋势过滤)
 
-                        df.ta.stoch(append=True, close='close', high='high', low='low')
-                        kdj_cols = [col for col in df.columns if col.startswith('STOCHk_') or col.startswith('STOCHd_')]
+            # 2. KDJ
 
-                        if len(kdj_cols) >= 2:
-                            k_col = kdj_cols[0]
-                            d_col = kdj_cols[1]
-                            j_col = 'KDJ_J'
+            df.ta.stoch(append=True, close='close', high='high', low='low')
+            kdj_cols = [col for col in df.columns if col.startswith('STOCHk_') or col.startswith('STOCHd_')]
+            if len(kdj_cols) >= 2:
+                   k_col = kdj_cols[0]
+                   d_col = kdj_cols[1]
+                   j_col = 'KDJ_J'
+                   df[j_col] = 3 * df[k_col] - 2 * df[d_col]
 
-                            # 1. 手动计算 J 值: J = 3K - 2D
-                            df[j_col] = 3 * df[k_col] - 2 * df[d_col]
+                   kdj_cross = (df[k_col] > df[d_col]) & (df[k_col].shift(1) <= df[d_col].shift(1))
+                   j_oversold = df[j_col].shift(1).rolling(window=3).min() < 0
+                   # 普通超卖：K和D都在20以下
+                   kd_oversold = (df[k_col] < 20) & (df[d_col] < 20)
 
-                            # 2. 定义基础状态
-                            # 金叉：K上穿D
-                            kdj_cross = (df[k_col] > df[d_col]) & (df[k_col].shift(1) <= df[d_col].shift(1))
-                            # 极度超卖：J值曾在过去3天内小于 0
-                            j_oversold = df[j_col].shift(1).rolling(window=3).min() < 0
-                            # 普通超卖：K和D都在20以下
-                            kd_oversold = (df[k_col] < 20) & (df[d_col] < 20)
+                   # 3. 定义高级信号：底背离 (Divergence)
+                   window = 10
+                   curr_low = df['low'].iloc[-1]
+                   curr_k = df[k_col].iloc[-1]
+                   min_k_window = df[k_col].iloc[-window:-1].min()
+                   min_low_window = df['low'].iloc[-window:-1].min()
+                   is_divergence = (curr_low <= min_low_window * 1.02) & (curr_k > min_k_window * 1.1)
 
-                            # 3. 定义高级信号：底背离 (Divergence)
-                            # 逻辑：价格(Low)创最近10天新低，但K值没有创最近10天新低
-                            # 简化算法：当前是金叉点，且价格低于前一个金叉点，但K值高于前一个金叉点 (这里用简化窗口法)
-                            window = 10
-                            curr_low = df['low'].iloc[-1]
-                            min_low_window = df['low'].iloc[-window:-1].min()
-                            curr_k = df[k_col].iloc[-1]
-                            min_k_window = df[k_col].iloc[-window:-1].min()
 
-                            # 背离判断：当前价格接近窗口最低价，但K值明显高于窗口最低K值
-                            is_divergence = (curr_low <= min_low_window * 1.02) & (curr_k > min_k_window * 1.1)
+                   ma5 = df['close'].rolling(window=5).mean()
+                   above_ma5 = df['close'] > ma5
 
-                            # 4. 辅助过滤：股价站上5日线 (右侧确认)
-                            ma5 = df['close'].rolling(window=5).mean()
-                            above_ma5 = df['close'] > ma5
 
-                            # --- 信号提取逻辑 ---
-                            current_idx = df.index[-1]  # 最后一行的索引
-                            last_row = df.iloc[-1]
-                            prev_row = df.iloc[-2]
+                   current_idx = df.index[-1]  # 最后一行的索引
+                   last_row = df.iloc[-1]
+                   prev_row = df.iloc[-2]
 
-                            signal_msg = ""
+                   signal_msg = ""
 
-                            # 场景 A: 极值 J 线反转 (最强短线信号)
-                            # 条件：昨日 J < 0, 今日 J > 5, 且今日金叉
-                            if prev_row[j_col] < 0 and last_row[j_col] > 5 and kdj_cross.iloc[-1]:
-                                signal_msg = "极值J线反转"
+                   # 场景 A: 极值 J 线反转 (最强短线信号)
 
-                            # 场景 B: 底背离金叉 (波段反转信号)
-                            # 条件：金叉 + 判定背离 + K<30 (低位)
-                            elif kdj_cross.iloc[-1] and is_divergence and last_row[k_col] < 30:
-                                signal_msg = "底背离金叉"
+                   if prev_row[j_col] < 0 and last_row[j_col] > 5 and kdj_cross.iloc[-1]:
+                    signal_msg = "极值J线反转"
 
-                            # 场景 C: 超卖区金叉 + 趋势确认 (稳健信号)
-                            # 条件：最近5天有过超卖 + 金叉 + 站上5日线
-                            elif (kd_oversold.iloc[-5:-1].sum() > 0) and kdj_cross.iloc[-1] and above_ma5.iloc[-1]:
+                   # 场景 B: 底背离金叉 (波段反转信号)
+
+                   elif kdj_cross.iloc[-1] and is_divergence and last_row[k_col] < 30:
+                       signal_msg = "底背离金叉"
+
+                   # 场景 C: 超卖区金叉 + 趋势确认 (稳健信号)
+
+                   elif (kd_oversold.iloc[-5:-1].sum() > 0) and kdj_cross.iloc[-1] and above_ma5.iloc[-1]:
                                 signal_msg = "趋势确认金叉"
 
                             # 场景 D: 普通低位金叉 (保留原有逻辑作为兜底)
-                            elif (kd_oversold.iloc[-5:-1].sum() > 0) and kdj_cross.iloc[-1]:
+                   elif (kd_oversold.iloc[-5:-1].sum() > 0) and kdj_cross.iloc[-1]:
                                 signal_msg = "低位超卖金叉"
 
                             # 如果有信号，则记录
-                            if signal_msg:
+                   if signal_msg:
                                 ta_signals['KDJ'].append({
                                     '股票代码': code,
                                     'KDJ_Signal': f"{signal_msg} (K={last_row[k_col]:.1f}, J={last_row[j_col]:.1f})"
                                 })
 
-                # 3. CCI (专业分类) - 使用 pandas_ta
-                df.ta.cci(append=True, close='close', high='high', low='low')
-                cci_cols = [col for col in df.columns if col.startswith('CCI_')]
-                if cci_cols:
+            # 3. CCI (专业分类) - 使用 pandas_ta
+            df.ta.cci(append=True, close='close', high='high', low='low')
+            cci_cols = [col for col in df.columns if col.startswith('CCI_')]
+            if cci_cols:
                     cci_col = cci_cols[0]
-
-                    # **核心改进点：使用专业分类函数**
                     current_cci = df[cci_col].iloc[-1]
                     cci_signal = self._classify_cci_level(current_cci)
 
-                    # 只有当CCI状态是超买或超卖时才记录，跳过常态波动/整理
-                    if cci_signal:
-                        ta_signals['CCI'].append(
-                            {'股票代码': code, 'CCI_Signal': cci_signal})
+                    # 【修复】如果状态为空（常态），则显示数值，确保不为空白
+                    if not cci_signal:
+                        cci_signal = f"常态波动 ({current_cci:.2f})"
 
-                # 4. RSI (超卖低位) - 使用 pandas_ta
-                df.ta.rsi(append=True, close='close', length=14)
-                rsi_cols = [col for col in df.columns if col.startswith('RSI_')]
-                if rsi_cols:
+                    ta_signals['CCI'].append({'股票代码': code, 'CCI_Signal': cci_signal})
+
+            # 4. RSI (超卖低位) - 使用 pandas_ta
+            df.ta.rsi(append=True, close='close', length=14)
+            rsi_cols = [col for col in df.columns if col.startswith('RSI_')]
+            if rsi_cols:
                     rsi_col = rsi_cols[0]
                     curr_rsi = df[rsi_col].iloc[-1]
                     window = 10
@@ -703,31 +667,26 @@ class StockAnalyzer:
                     is_rsi_divergence = (is_price_low) and \
                                         (curr_rsi > min_rsi_window * 1.05) and \
                                         (curr_rsi < 50)
+                    rsi_msg = f"RSI={curr_rsi:.1f}"
                     if is_rsi_divergence:
-                        ta_signals['RSI'].append({'股票代码': code,
-                                                  'RSI_Signal': f"RSI底背离 (Price低={curr_low}, RSI={curr_rsi:.1f}, 前RSI低={min_rsi_window:.1f})"})
+                        rsi_msg = f"RSI底背离! ({curr_rsi:.1f})"
+                    ta_signals['RSI'].append({'股票代码': code, 'RSI_Signal': rsi_msg})
 
-                # 5. BOLL (低波/缩口) - 使用 pandas_ta
-                df.ta.bbands(append=True, length=20, std=2, close='close')
-                boll_cols = [col for col in df.columns if col.startswith('BBL_')]
-                if boll_cols:
+            # 5. BOLL (低波/缩口) - 使用 pandas_ta
+            df.ta.bbands(append=True, length=20, std=2, close='close')
+            boll_cols = [col for col in df.columns if col.startswith('BBL_')]
+            if boll_cols:
                     lower_band = boll_cols[0]
                     upper_band = [col for col in df.columns if col.startswith('BBU_')][0]
-                    # 计算带宽
                     df['BOLL_BANDWIDTH'] = (df[upper_band] - df[lower_band]) / df['close']
-                    # 最近 N 天的平均带宽低于历史平均带宽（表示缩口）
-                    if df['BOLL_BANDWIDTH'].iloc[-5:].mean() < df['BOLL_BANDWIDTH'].mean():
-                        # 仅记录信号，不包含评分
-                        ta_signals['BOLL'].append({'股票代码': code, 'BOLL_Signal': '低波/缩口'})
 
-            except KeyError as ke:
-                # 捕获 MACDH_12_26_9 或其他指标列名找不到的错误
-                print(f"[ERROR] 计算 {code} 的 TA 指标时出错: 关键指标列名丢失 ({ke})")
-            except Exception as e:
-                print(f"[ERROR] 计算 {code} 的 TA 指标时出错: {e}")
-                continue
+                    is_narrow = df['BOLL_BANDWIDTH'].iloc[-5:].mean() < df['BOLL_BANDWIDTH'].mean()
 
-        # 将结果列表转换为 DataFrame
+                    boll_msg = "低波/缩口" if is_narrow else "常态/张口"
+
+                    ta_signals['BOLL'].append({'股票代码': code, 'BOLL_Signal': boll_msg})
+
+
         final_ta_dfs = {}
         for key, value in ta_signals.items():
             final_ta_dfs[key] = pd.DataFrame(value)
@@ -739,9 +698,9 @@ class StockAnalyzer:
         print("正在处理并合并均线突破数据...")
 
         # 1. 清洗均线数据
-        processed_df10 = raw_data['xstp_10_raw'].rename(columns={'最新价': '10日均线最新价'})
-        processed_df30 = raw_data['xstp_30_raw'].rename(columns={'最新价': '30日均线最新价'})
-        processed_df60 = raw_data['xstp_60_raw'].rename(columns={'最新价': '60日均线最新价'})
+        processed_df10 = raw_data['xstp_10_raw'].rename(columns={'最新价': '10日均线价'})
+        processed_df30 = raw_data['xstp_30_raw'].rename(columns={'最新价': '30日均线价'})
+        processed_df60 = raw_data['xstp_60_raw'].rename(columns={'最新价': '60日均线价'})
 
         # 2. 合并
         # 使用concat时只保留代码和简称，避免价格列冲突
@@ -753,9 +712,9 @@ class StockAnalyzer:
 
         # 3. 重新合并均线价格，确保同一行有所有数据
         xstp_base = merged_df[['股票代码', '股票简称']].drop_duplicates()
-        xstp_base = pd.merge(xstp_base, processed_df10[['股票代码', '10日均线最新价']], on='股票代码', how='left')
-        xstp_base = pd.merge(xstp_base, processed_df30[['股票代码', '30日均线最新价']], on='股票代码', how='left')
-        xstp_base = pd.merge(xstp_base, processed_df60[['股票代码', '60日均线最新价']], on='股票代码', how='left')
+        xstp_base = pd.merge(xstp_base, processed_df10[['股票代码', '10日均线价']], on='股票代码', how='left')
+        xstp_base = pd.merge(xstp_base, processed_df30[['股票代码', '30日均线价']], on='股票代码', how='left')
+        xstp_base = pd.merge(xstp_base, processed_df60[['股票代码', '60日均线价']], on='股票代码', how='left')
 
         # 4. 合并实时价格 (此处仍然按代码合并，以便于均线计算的准确性)
         xstp_base = pd.merge(xstp_base, spot_df[['股票代码', '最新价']], on='股票代码', how='left')
@@ -768,18 +727,18 @@ class StockAnalyzer:
 
         # 过滤条件: 1. 最新价>10日均线 2. 多头排列 (10>30 或 30>60)
         filtered_df = xstp_base[
-            (xstp_base['最新价'] > xstp_base['10日均线最新价']) &
+            (xstp_base['最新价'] > xstp_base['10日均线价']) &
             (
-                    (xstp_base['10日均线最新价'] > xstp_base['30日均线最新价'].fillna(float('-inf'))) |
-                    (xstp_base['30日均线最新价'] > xstp_base['60日均线最新价'].fillna(float('-inf')))
+                    (xstp_base['10日均线价'] > xstp_base['30日均线价'].fillna(float('-inf'))) |
+                    (xstp_base['30日均线价'] > xstp_base['60日均线价'].fillna(float('-inf')))
             )
             ].copy()
 
         # 添加完全多头排列标记
         filtered_df['完全多头排列'] = filtered_df.apply(
             # 需要确保在计算前处理 NaN 值，这里使用一个较大的负数代替 NaN
-            lambda row: '是' if row['10日均线最新价'] > row['30日均线最新价'] and row['30日均线最新价'] > row[
-                '60日均线最新价'] else '否',
+            lambda row: '是' if row['10日均线价'] > row['30日均线价'] and row['30日均线价'] > row[
+                '60日均线价'] else '否',
             axis=1
         )
 
@@ -792,7 +751,6 @@ class StockAnalyzer:
         """合并所有数据源和信号，生成最终汇总报告。"""
         print("\n>>> 正在汇总所有数据和信号 (技术指标作为独立列)...")
 
-        # 1. 提取所有有信号的股票代码作为基础 (
         all_codes = set()
         data_sources = [
             processed_data.get('processed_main_report'),
@@ -891,7 +849,7 @@ class StockAnalyzer:
 
         # B. 均线信号 (多头排列)
         xstp_df = processed_data['processed_xstp_df']
-        xstp_cols = ['股票代码', '完全多头排列', '当前价格', '10日均线最新价', '30日均线最新价', '60日均线最新价']
+        xstp_cols = ['股票代码', '完全多头排列', '当前价格', '10日均线价', '30日均线价', '60日均线价']
 
 
         if not xstp_df.empty and '股票代码' in xstp_df.columns:
@@ -949,16 +907,16 @@ class StockAnalyzer:
                 elif v5 > 0:
                     return "流入"
                 else:
-                    return "谨慎观察"
+                    return ""
 
             # 创建新列
-            final_df['资金趋势向上'] = final_df.apply(calculate_trend, axis=1)
+            final_df['资金动能'] = final_df.apply(calculate_trend, axis=1)
 
             # 调整列顺序，将参考列放到资金列旁边便于对比
             cols = list(final_df.columns)
-            if '资金趋势向上' in cols:
+            if '资金动能' in cols:
                 target_idx = cols.index(f5_col)
-                cols.insert(target_idx + 1, cols.pop(cols.index('资金趋势向上')))
+                cols.insert(target_idx + 1, cols.pop(cols.index('资金动能')))
                 final_df = final_df[cols]
 
 
@@ -1117,8 +1075,8 @@ class StockAnalyzer:
             'KDJ_Signal', 'CCI_Signal', 'RSI_Signal', 'BOLL_Signal',
         ]
         report_cols = [
-            '研报买入次数', '完全多头排列', '10日均线最新价', '30日均线最新价', '60日均线最新价',
-            '5日资金流入', '10日资金流入', '20日资金流入'
+            '研报买入次数', '完全多头排列', '10日均线价', '30日均线价', '60日均线价',
+            '资金动能','5日资金流入', '10日资金流入', '20日资金流入'
         ]
 
         # 将新列 '股票链接' 添加到列列表的末尾
