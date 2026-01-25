@@ -8,7 +8,7 @@ from typing import Callable, Dict, Any, List
 import numpy as np
 import ParallelUtils as  utils
 import pandas_ta as ta
-
+import Industrytrending as industry
 
 class Config:
     """程序配置类"""
@@ -1085,6 +1085,25 @@ class StockAnalyzer:
 
         return final_df
 
+    def _merge_industry_signal_to_stocks(self, stock_df: pd.DataFrame, industry_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        将行业分析的结论('行业信号'列)，精准匹配到每一只股票上。
+        """
+        if industry_df.empty or stock_df.empty or '行业' not in stock_df.columns:
+            stock_df['所属行业信号'] = ''
+            return stock_df
+
+        print("  - 正在将行业信号映射至个股...")
+        # 建立映射字典： 行业名称 -> 行业信号
+        signal_map = industry_df.set_index('行业名称')['行业信号'].to_dict()
+        score_map = industry_df.set_index('行业名称')['趋势得分'].to_dict()
+
+        # 映射
+        stock_df['所属行业信号'] = stock_df['行业'].map(signal_map).fillna('')
+        stock_df['行业趋势分'] = stock_df['行业'].map(score_map).fillna(0)
+
+        return stock_df
+
     def _generate_report(self, sheets_data: Dict[str, pd.DataFrame]):
         """生成 Excel 报告。"""
         print(f"\n>>> 正在生成 Excel 报告...")
@@ -1137,7 +1156,12 @@ class StockAnalyzer:
         print(f"股票分析程序启动 (Today: {self.today_str})")
 
         try:
-            # 1. 获取所有原始数据
+
+            # 预处理行业权重数据
+            industry_analyzer = industry.IndustryFlowAnalyzer(self.config)
+            industry_analysis_df = industry_analyzer.run_analysis()
+
+            # 获取所有原始数据
             raw_data = self._get_all_raw_data()
 
             # 预处理主力研报数据
@@ -1222,10 +1246,19 @@ class StockAnalyzer:
             }
 
             consolidated_report = self._consolidate_data(processed_data)
+            consolidated_report = self._merge_industry_signal_to_stocks(consolidated_report, industry_analysis_df)
+
+            cols = list(consolidated_report.columns)
+            if '所属行业信号' in cols and '行业' in cols:
+                cols.remove('所属行业信号')
+                idx = cols.index('行业')
+                cols.insert(idx + 1, '所属行业信号')
+                consolidated_report = consolidated_report[cols]
 
             # 6. 准备报告数据
             sheets_data = {
                 '数据汇总': consolidated_report,  # 替换为数据汇总表
+                '行业深度分析': industry_analysis_df,
                 '主力研报筛选': processed_data['processed_main_report'],
                 '均线多头排列': processed_xstp_df,  # 使用处理后且过滤后的数据
                 '实时行情': spot_df,  # 使用清洗后的数据
