@@ -8,5 +8,17 @@
     "type": "failure",
     "error": "WFO 系统性失败: 连续 3 个窗口 OOS 衰减校验全部失败",
     "time": "2026-08-17T11:27:20.175602"
+  },
+  {
+    "type": "failure",
+    "error": "'BacktestConfig' object has no attribute 'MAX_ORDER_PCT'",
+    "time": "2026-08-19T02:42:21.398630",
+    "snapshot_id": "4888ebb628d1a2a8",
+    "error_code": "PIPELINE_FAILED"
+  },
+  {
+    "type": "failure",
+    "error": "WFO 系统性失败: 所有 4 条路径均无有效窗口通过 OOS 校验；策略在当前数据区间无泛化能力",
+    "time": "2026-08-21T03:33:32.946282"
   }
 ]

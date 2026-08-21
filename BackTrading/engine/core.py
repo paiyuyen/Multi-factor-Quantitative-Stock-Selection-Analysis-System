@@ -1821,15 +1821,15 @@ def _run_single_backtest(
                 _af_now = float(_af_arr[_k])
                 if not (np.isfinite(_af_now) and _af_now > 0):
                     continue
-                _prev_af = _pos_adjf.get(_s)
+                _pos_prev_af = _pos_adjf.get(_s)
                 _si = idx[_k]
-                if _prev_af is not None and abs(_prev_af - _af_now) > 1e-12 and pos_shares[_si] > 0:
+                if _pos_prev_af is not None and abs(_pos_prev_af - _af_now) > 1e-12 and pos_shares[_si] > 0:
                     # P0-2 审计修复：除权碎股合规性。
                     # 旧实现四舍五入：int(shares × ratio + 0.5)，向上偏置导致
                     # pos_value/pos_shares 单位成本低于真实成本，虚增净值。
                     # 新实现：向下取整到整手，碎股部分按真实收盘价折算现金（A股现金替代规则）。
                     # pos_value 守恒：碎股对应成本从 pos_value 中扣除，加入 cash。
-                    _raw_shares = pos_shares[_si] * (_af_now / _prev_af)
+                    _raw_shares = pos_shares[_si] * (_af_now / _pos_prev_af)
                     _lot = lot_size_for(_s)
                     _sh_new = int(_raw_shares // _lot) * _lot  # 向下取整到整手
                     if _sh_new <= 0:
@@ -1864,8 +1864,8 @@ def _run_single_backtest(
                     if _sh_new > 0 and _sh_new != int(pos_shares[_si]):
                         logger.info(
                             f"[除权调整] {dt} {_s} 持仓 {pos_shares[_si]:.0f} 股 "
-                            f"×{_af_now / _prev_af:.6f} → {_sh_new} 股"
-                            f"（adj_factor {_prev_af:.6f}→{_af_now:.6f}）"
+                            f"×{_af_now / _pos_prev_af:.6f} → {_sh_new} 股"
+                            f"（adj_factor {_pos_prev_af:.6f}→{_af_now:.6f}）"
                         )
                         pos_shares[_si] = _sh_new
                 if pos_shares[_si] > 0:

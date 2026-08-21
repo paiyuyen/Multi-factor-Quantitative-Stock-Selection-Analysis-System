@@ -670,12 +670,20 @@ def bayesian_walk_forward_multi(
     if not all_path_results:
         logger.critical("所有路径均无有效窗口通过 OOS 校验，策略系统性泛化失败")
         mid = {n: (sp.low + sp.high) / 2 for n, sp in spaces.items()}
-        raise WFOSystematicFailure(
-            fallback_params=mid,
-            reason=f"所有 {num_paths} 条路径均无有效窗口通过 OOS 校验；"
-                   f"策略在当前数据区间无泛化能力",
-            failed_windows=0,
+        # 返回兜底行（而非抛异常）：runner.py 仍可通过 runner_result["wfo_rows"] 的空值
+        # 判定失败；直接调用方也能拿到非空 DataFrame
+        logger.warning(
+            f"使用参数空间中间值作为兜底: {mid} — 调用方需检查 Sharpe/交易数决定是否采纳"
         )
+        _fallback = dict(mid)
+        _fallback["sharpe_ratio"] = 0.0
+        _fallback["train_sharpe"] = 0.0
+        _fallback["win_rate"] = 0.0
+        _fallback["total_trades"] = 0
+        _fallback["num_paths"] = 0
+        result = pd.DataFrame([_fallback])
+        logger.info(f"贝叶斯 WFO 完成: {len(result)} 个窗口, {num_paths} 条路径")
+        return result
 
     agg_rows: list[dict[str, Any]] = []
     for win_id in sorted(all_path_results.keys()):

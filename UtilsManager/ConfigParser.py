@@ -678,6 +678,16 @@ class PortfolioOptimizerConfig(BaseModel):
     OPTIMIZER_MAX_WEIGHT_RANGE: str = Field(default="0.05,0.15,0.01", description="单票权重上限寻优范围")
     OPTIMIZER_COV_LOOKBACK_RANGE: str = Field(default="30,120,10", description="协方差窗口寻优范围")
 
+    def parse_range(self, key: str) -> tuple[float, float, float]:
+        raw = getattr(self, key.upper(), "")
+        if not raw or not raw.strip():
+            raise ValueError(f"{key} 未配置，跳过")
+        parts = [float(x.strip()) for x in raw.split(",")]
+        if len(parts) != 3:
+            msg = f"{key} 格式应为 min,max,step，收到 {raw!r}"
+            raise ValueError(msg)
+        return (parts[0], parts[1], parts[2])
+
 
 class PositionSizingConfig(BaseModel):
     """仓位管理配置模型"""
