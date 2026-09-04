@@ -131,7 +131,7 @@ def optimize_window(
     compute_exit_strategy: bool = True,
     eval_start_date: str | None = None,
     st_history: dict | None = None,
-    exclude_st: bool = True,
+    exclude_st: bool = False,  # FIX(P0): 回测默认不排除 ST
     data_version: str | None = None,
     listing_days: dict | None = None,
     db_engine: Any = None,

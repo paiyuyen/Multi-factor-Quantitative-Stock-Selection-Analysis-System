@@ -421,8 +421,6 @@ class BacktestConfig(BaseModel):
                                           description="各档冲击启用阈值（占ADV比例）")
     LIQUIDITY_TIER_CAP: str = Field(default="0.10,0.05,0.05,0.03",
                                     description="各档冲击成本上限")
-    EXCLUDE_ST: bool = Field(default=True,
-                             description="回测宇宙剔除 ST/*ST 风险警示股（主板 5% 涨跌幅、流动性差）")
     MAX_POSITION_PCT: float = Field(default=0.1, ge=0.01, le=1.0)
     PORTFOLIO_METHOD: str = Field(default="score_weighted")
     POINT_IN_TIME: bool = Field(default=True)
@@ -469,7 +467,7 @@ class BacktestConfig(BaseModel):
     # P0-7 ②：校准闭环 —— [BACKTEST_CALIBRATED] 覆写目标（默认取区间中位，
     # 与旧日频回退口径 int(17.5)=17 / int(11.5)=11 保持一致；校准后由
     # write_calibration_to_ini 写回、此处读取，供日频路径 EngineConfig 兜底使用）
-    BUY_THRESHOLD: int = Field(default=17, ge=1, le=100,
+    BUY_THRESHOLD: int = Field(default=12, ge=1, le=100,
                                description="买入评分阈值（校准覆写目标，WFO 未寻优时兜底）")
     MAX_HOLDINGS: int = Field(default=11, ge=0, le=100,
                               description="最大同时持仓数，0=不限制（校准覆写目标，WFO 未寻优时兜底）")

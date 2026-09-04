@@ -39,7 +39,7 @@ class FactorRiskModel:
     """基于正交化因子暴露的组合风险归因模型。"""
 
     DEFAULT_IDIO_VOL = DEFAULT_IDIO_VOL
-    TRADING_DAYS = 252
+    TRADING_DAYS = 244  # A股实际年化交易日数均值（非美股252）
 
     # ── 核心归因 ────────────────────────────────────────────
 

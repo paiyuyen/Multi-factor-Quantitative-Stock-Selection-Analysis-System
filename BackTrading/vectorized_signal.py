@@ -53,7 +53,8 @@ def _regime_series(
     """全向量化的市场状态检测，返回逐 bar 的 regime 字符串数组。"""
     if params is None:
         params = {}
-    close = df["close"]
+    # P1.16 修复：_regime_series 中 close 必须也使用复权价，与 prepare.py / Indicators.py 对齐。
+    close = df["close_normal"] if "close_normal" in df.columns else df["close"]
     ma5 = df["MA_5"]
     ma10 = df["MA_10"]
     ma20 = df["MA_20"]
@@ -314,22 +315,23 @@ def _momentum(dif: pd.Series, dea: pd.Series, max_score: int = 15) -> np.ndarray
     norm_change = (hist_change / hist_vol).fillna(0).to_numpy()
     is_bull = (hist > 0).to_numpy()
 
-    score = np.zeros(len(hist), dtype=np.int32)
+    # FIX(P1) Subtask-7：评分精度改造 — int32 → float64，保留因子差异
+    score = np.zeros(len(hist), dtype=np.float64)
     bull_mask = is_bull & (norm_change >= 0)
     score[bull_mask] = np.clip(
-        (max_score * (0.5 + 0.5 * norm_change[bull_mask] / (norm_change[bull_mask] + 1))).astype(int),
+        (max_score * (0.5 + 0.5 * norm_change[bull_mask] / (norm_change[bull_mask] + 1))),
         0, max_score,
     )
     bull_dec = is_bull & (norm_change < 0)
     score[bull_dec] = np.clip(
-        (max_score * (0.5 + 0.5 * norm_change[bull_dec] / (norm_change[bull_dec] - 1))).astype(int),
+        (max_score * (0.5 + 0.5 * norm_change[bull_dec] / (norm_change[bull_dec] - 1))),
         0, max_score,
     )
     bear = ~is_bull
     max_bear = max(8, max_score * 2 // 5)
     abs_norm = np.abs(norm_change)
     score[bear] = np.clip(
-        (max_bear * abs_norm[bear] / (abs_norm[bear] + 1)).astype(int),
+        max_bear * abs_norm[bear] / (abs_norm[bear] + 1),
         0, max_bear,
     )
     score[:6] = 0
@@ -343,8 +345,9 @@ def _momentum(dif: pd.Series, dea: pd.Series, max_score: int = 15) -> np.ndarray
 def _dif_slope(dif: pd.Series, window: int = 5, max_score: int = 10) -> np.ndarray:
     """逐 bar 的 DIF 斜率得分 — 纯向量化 (np.correlate)。"""
     arr = dif.values.astype(np.float64)
+    # FIX(P1) Subtask-7：评分精度改造 — int32 → float64
     n = len(arr)
-    score = np.zeros(n, dtype=np.int32)
+    score = np.zeros(n, dtype=np.float64)
     if n < window:
         return score
 
@@ -368,7 +371,7 @@ def _dif_slope(dif: pd.Series, window: int = 5, max_score: int = 10) -> np.ndarr
     mask_pos = (slopes > 0) & (r2 > 0.7)
     mask_mid = (slopes > 0) & (r2 <= 0.7)
     score[bar_idx[mask_pos]] = max_score
-    score[bar_idx[mask_mid]] = int(max_score * 0.55)
+    score[bar_idx[mask_mid]] = max_score * 0.55
     return score
 
 
@@ -378,17 +381,23 @@ def _dif_slope(dif: pd.Series, window: int = 5, max_score: int = 10) -> np.ndarr
 
 def _volume_price(df: pd.DataFrame, lookback: int = 5, max_score: int = 10) -> np.ndarray:
     """逐 bar 量价配合得分 — 全向量化。"""
-    close = df["close"].values
+    # P1.16 修复：_regime_series 中 close 必须也使用复权价，与 prepare.py / Indicators.py 对齐。
+    # 强制 .values 转为 numpy 数组：Series 按整数数组索引是label-based，
+    # 与非默认 index 混用时会造成 shape mismatch，必须走位置索引。
+    if "close_normal" in df.columns:
+        close = df["close_normal"].values
+    else:
+        close = df["close"].values
     volume = df["volume"].values
     n = len(df)
     half = max_score // 2
-    score = np.zeros(n, dtype=np.int32)
+    # FIX(P1) Subtask-7：评分精度改造 — int32 → float64
+    score = np.zeros(n, dtype=np.float64)
 
     if n <= lookback:
         return score
 
     # 价格涨跌幅 (close[i] - close[i-lookback+1]) / close[i-lookback+1]
-    pct = np.zeros(n)
     pct_idx = np.arange(lookback - 1, n)
     prev = pct_idx - lookback + 1
     pct[pct_idx] = (close[pct_idx] - close[prev]) / np.maximum(close[prev], 1e-9)
@@ -420,13 +429,20 @@ def _volume_price(df: pd.DataFrame, lookback: int = 5, max_score: int = 10) -> n
 
 def _kline_pattern(df: pd.DataFrame, max_score: int = 10) -> np.ndarray:
     """逐 bar K 线形态得分 — 全向量化。"""
-    close = df["close"].values
+    # P1.16 修复：_regime_series 中 close 必须也使用复权价，与 prepare.py / Indicators.py 对齐。
+    # 强制 .values 转 numpy 数组：Series 按整数数组/布尔掩码索引是 label-based，
+    # 与非默认 index 混用时可能错位，必须走位置索引。
+    if "close_normal" in df.columns:
+        close = df["close_normal"].values
+    else:
+        close = df["close"].values
     open_ = df["open"].values
     high = df["high"].values
     low = df["low"].values
+    # FIX(P1) Subtask-7：K线形态评分 float64
     n = len(df)
     if n < 5:
-        return np.zeros(n, dtype=np.int32)
+        return np.zeros(n, dtype=np.float64)
 
     # ── 单 bar 特征 ──
     body = np.abs(close - open_)
@@ -496,7 +512,8 @@ def _kline_pattern(df: pd.DataFrame, max_score: int = 10) -> np.ndarray:
     # ── 合并 + 归一化 ──
     raw_total = bar_acc + triple_acc + eng_acc
     norm = np.clip(raw_total / 10.0, -1.0, 1.0)
-    scores = ((norm + 1.0) / 2.0 * max_score).astype(np.int32)
+    # FIX(P1) Subtask-7：K线形态评分 float64
+    scores = ((norm + 1.0) / 2.0 * max_score)
     scores[:5] = 0
     return scores
 
@@ -528,10 +545,17 @@ def golden_cross_score(
 
     golden_strength = (dif - dea).abs() / atr.replace(0, np.nan)
 
-    # 统一归一化 vol_norm_denom 为 ndarray，避免 pd.Series / np.ndarray
-    # 因索引不一致导致静默错位（golden_strength 是 Series，有自定义 index）
+    # FIX(P1) Subtask-8：波动率归一化动态化
+    # 旧实现：vol_norm_denom 为标量时，直接用 0.15 全局除以 golden_strength。
+    # 低波动期 golden_strength 远 <0.15 → vol_factor 恒为 1.0（信号无区分度）；
+    # 高波动期 golden_strength >> 0.15 → vol_factor 过度压制。
+    # 新实现：改用 golden_strength 滚动 60 日中位数，不足 60 日回退到参数值。
     if np.isscalar(vol_norm_denom):
-        vol_norm_arr = np.full(n, float(vol_norm_denom), dtype=np.float64)
+        gs_values = golden_strength.fillna(0).values
+        gs_series = pd.Series(gs_values)
+        gs_rolling_median = gs_series.rolling(60, min_periods=10).median()
+        vol_norm_arr = gs_rolling_median.fillna(float(vol_norm_denom)).values
+        vol_norm_arr = np.maximum(vol_norm_arr, 1e-9)
     else:
         vol_norm_arr = np.asarray(vol_norm_denom, dtype=np.float64)
         if len(vol_norm_arr) != n:
@@ -549,13 +573,14 @@ def golden_cross_score(
     # R04 金叉加分：仅作用于金叉触发当日，按信号强度缩放
     bonus = float(golden_cross_bonus) * vol_factor
 
-    score = np.zeros(n, dtype=np.int32)
+    # FIX(P1) Subtask-7：金叉评分 float64 精度
+    score = np.zeros(n, dtype=np.float64)
     mask_za = golden_zero_above.values
-    score[mask_za] = (w_cross * vol_factor[mask_za] + bonus[mask_za]).astype(int)
+    score[mask_za] = w_cross * vol_factor[mask_za] + bonus[mask_za]
     mask_zb = golden_zero_below.values
-    score[mask_zb] = (w_cross // 2 * vol_factor[mask_zb] + bonus[mask_zb]).astype(int)
+    score[mask_zb] = (w_cross / 2) * vol_factor[mask_zb] + bonus[mask_zb]
     mask_bull = is_bull.values & ~mask_za & ~mask_zb
-    score[mask_bull] = (w_cross * 0.75 * vol_factor[mask_bull]).astype(int)
+    score[mask_bull] = w_cross * 0.75 * vol_factor[mask_bull]
 
     # 衰减向量化: 覆盖 cross 区间 c ∈ (i - cross_decay_days, i]（含 cross 当日）。
     # 衰减随距离单调递减 → 每 bar 取区间内**最远**（最早）cross 的衰减 = 最严格值，
@@ -578,7 +603,8 @@ def golden_cross_score(
         1.0,
     )
 
-    score = (score.astype(np.float64) * decay_mult).astype(np.int32)
+    # FIX(P1) Subtask-7：衰减后保持 float64
+    score = score.astype(np.float64) * decay_mult
     return score
 
 
@@ -659,11 +685,11 @@ def _composite_score(
     }
     trend_scores = np.vectorize(trend_score_map.get)(macd_trend_arr)
 
-    # divergence 评分
-    div_score = np.zeros(n, dtype=np.int32)
+    # FIX(P1) Subtask-7：背离评分 float64 精度
+    div_score = np.zeros(n, dtype=np.float64)
     bot_div = np.char.find(div_type.astype(str), Divergence.BOTTOM_DIVERGENCE) >= 0
     eff = div_strength * div_decay
-    div_score[bot_div] = (w_div * (0.5 + 0.5 * eff[bot_div])).astype(int)
+    div_score[bot_div] = w_div * (0.5 + 0.5 * eff[bot_div])
 
     # R41 顶背离扣分（按背离强度缩放）
     top_div = np.char.find(div_type.astype(str), Divergence.TOP_DIVERGENCE) >= 0

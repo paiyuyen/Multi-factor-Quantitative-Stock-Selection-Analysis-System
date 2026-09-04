@@ -147,9 +147,18 @@ def calc_limit_prices(
     P0-11 审计修复：以交易所 ROUND_HALF_UP（四舍五入）替代 Python round 的
     银行家舍入（round-half-even）——第三位小数恰为 5 时 round 会舍向偶数，
     与交易所规则系统性偏差 0.01 元，影响封板/一字板/可成交量判定。
+
+    P2.1 修复：中间计算使用 Decimal 精确十进制算术，避免高价位股票（如茅台 1800+）
+    浮点乘法误差导致 10.505 → 10.50499999... → 低位舍入偏差。
     """
-    up = _round_half_up_scalar(prev_close * (1 + ratio_up))
-    down = _round_half_up_scalar(prev_close * (1 - ratio_down))
+    # Decimal 精确计算替代 float 乘法
+    pc_d = Decimal(str(prev_close))
+    up = float((pc_d * (1 + Decimal(str(ratio_up)))).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    ))
+    down = float((pc_d * (1 - Decimal(str(ratio_down)))).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    ))
     return up, down
 
 
@@ -207,6 +216,7 @@ def limit_prices_for(
     symbol: str,
     *,
     is_st: bool = False,
+    is_delisting: bool = False,
     listing_days: Optional[int] = None,
     trade_date: Optional[str] = None,
 ) -> LimitPriceInfo:
@@ -217,29 +227,39 @@ def limit_prices_for(
         symbol: 股票代码（sh600000 / 600000.SH / 600000）— 保留参数兼容签名，
                  系统仅覆盖沪深主板，不再按代码分派板块规则。
         is_st: 当日是否为 ST/*ST（涨跌幅 5%）。
+        is_delisting: 当日是否处于退市整理期（涨跌幅 10%，独立于 ST 规则）。
         listing_days: 上市第 N 个交易日（1=首日）；None 视为已上市多日（无豁免）。
         trade_date: "YYYY-MM-DD"，主板注册制前后规则切换用。
 
     Returns:
         LimitPriceInfo：exempt=True 时 limit_up/down 用 ±100% 近似无限制。
     """
-    # P1 审计修复：非主板代码进入时发出 warning，防止 silently 使用错误涨跌幅
+    # P1 审计修复 + P1.10 精确前缀匹配：非主板代码进入时直接拦截（fail-fast）
+    # 使用精确前缀集合替代 startswith，避免 8/4 单字符前缀误匹配其他代码段。
+    _MAIN_BOARD_PREFIXES = {"600", "601", "603", "605", "000", "001", "002", "003"}
+    _GEM_PREFIXES = {"300", "301"}
+    _STAR_PREFIXES = {"688"}
+    _BSE_PREFIXES = {"83", "87", "43", "89"}
+
     _digits = _CODE_RE.search(symbol)
     if _digits is not None:
         _code = _digits.group(1)
-        if _code.startswith("300"):
-            logger.warning(
-                f"[涨跌停] {symbol} 为创业板（300），应使用 ±20% 规则而非主板 ±10%。"
+        _prefix = _code[:3]
+
+        # P1.10：精确前缀集合拦截，不依赖单字符 startswith
+        if _prefix in _GEM_PREFIXES:
+            raise ValueError(
+                f"[涨跌停] {symbol} 为创业板（{_prefix}），不适用主板涨跌停规则。"
                 f"请确认 stock_basic_info 过滤正确或关闭 main_board_only。"
             )
-        elif _code.startswith("688"):
-            logger.warning(
-                f"[涨跌停] {symbol} 为科创板（688），应使用 ±20% 规则而非主板 ±10%。"
+        elif _prefix in _STAR_PREFIXES:
+            raise ValueError(
+                f"[涨跌停] {symbol} 为科创板（{_prefix}），不适用主板涨跌停规则。"
                 f"请确认 stock_basic_info 过滤正确或关闭 main_board_only。"
             )
-        elif _code.startswith("8") or _code.startswith("4"):
-            logger.warning(
-                f"[涨跌停] {symbol} 为北交所（{ _code[0] }xxx），应使用 ±30% 规则而非主板 ±10%。"
+        elif _code[:2] in _BSE_PREFIXES:
+            raise ValueError(
+                f"[涨跌停] {symbol} 为北交所（{_code[:2]}），不适用主板涨跌停规则。"
                 f"请确认 stock_basic_info 过滤正确或关闭 main_board_only。"
             )
 
@@ -248,7 +268,19 @@ def limit_prices_for(
         exempt = listing_days <= listing_exempt_days(trade_date)
 
     if exempt:
-        ratio_up = ratio_down = 1.0
+        # P1.9 修复：新股豁免期返回 inf 涨跌停价，确保判定逻辑自动放行。
+        # 原实现 ratio=1.0 导致所有价位均触发涨跌停守卫，误杀正常买入/卖出。
+        return LimitPriceInfo(
+            ratio_up=float("inf"),
+            ratio_down=float("inf"),
+            limit_up=float("inf"),
+            limit_down=float("-inf"),
+            exempt=True,
+            is_st=False,
+        )
+    elif is_delisting:
+        # P0.5 修复：退市整理期涨跌幅 ±10%，独立于 ST ±5% 规则
+        ratio_up = ratio_down = MAIN_BOARD_LIMIT_RATIO
     elif (
         listing_days == 1
         and (trade_date is None or str(trade_date)[:10] < MAIN_BOARD_REFORM_DATE)
@@ -350,28 +382,40 @@ def auction_fill_ratio_for(
     limit_up: float,
     limit_down: float,
     *,
+    side: str = "sell",
     tradable_up_ratio: float = 0.30,
     tradable_down_ratio: float = 0.30,
     board_streak: int = 1,
     seal_decay: float = 0.5,
 ) -> float:
-    """开盘集合竞价时点（9:25）的可成交量比例 — P1-2 前视修复 + 方向区分。
+    """开盘集合竞价时点（9:25）的可成交量比例 — P1-2 前视修复 + P0.4 方向区分。
 
-    竞价撮合瞬间当日 high/low/close 尚不可知，档位判定只允许使用 9:25
-    已知信息：open（竞价成交价，9:25 产生）与 limit_up/limit_down（昨收推得）。
-    不得复用 fill_ratio_for 的全天档位口径（一字/炸板/盘中冲板依赖当日
-    close/high/low，属未来信息）：
-        - open 触及涨停价 → 取 tradable_up_ratio（涨停开盘买方排队深，
-          流动性不对称：卖方提供流动性相对容易，买方成交难）
-        - open 触及跌停价 → 取 tradable_down_ratio（跌停开盘恐慌抛压，
-          卖方成交困难，但炸板后流动性通常好于涨停封板）
-        - 否则 1.0（竞价价未触板，无限制）
-    连板衰减沿用前日连板数（收盘已知，无前视）。
+    P0.4 修复：涨停开盘买卖方向成交率区分——
+        - 涨停开盘时买方排队深，买入成交极难（~5%）
+        - 涨停开盘时卖方提供流动性，卖出相对容易（~60%）
+        - 跌停开盘反之，卖出极难（~5%），买方相对容易接盘（~60%）
+    side="buy" 时买入方向取保守比，"sell" 时取宽松比。
     """
     touched_up = open_price is not None and open_price >= limit_up - _LIMIT_EPS
     touched_down = open_price is not None and open_price <= limit_down + _LIMIT_EPS
+
+    decay = seal_decay ** max(0, board_streak - 1)
+
     if touched_up:
-        return tradable_up_ratio * (seal_decay ** max(0, board_streak - 1))
+        # P0.4：按方向拆分成交率
+        if side == "buy":
+            # 涨停开盘买入极难——买方排队深，仅少量成交
+            _ratio = 0.05
+        else:
+            # 涨停开盘卖出相对容易——卖方向市场提供流动性
+            _ratio = tradable_up_ratio
+        return _ratio * decay
     if touched_down:
-        return tradable_down_ratio * (seal_decay ** max(0, board_streak - 1))
+        if side == "sell":
+            # 跌停开盘卖出极难——卖方恐慌抛压
+            _ratio = 0.05
+        else:
+            # 跌停开盘买入相对容易——逆势抄底有流动性
+            _ratio = tradable_down_ratio
+        return _ratio * decay
     return 1.0

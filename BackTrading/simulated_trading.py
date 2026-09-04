@@ -67,7 +67,7 @@ def _cost_model_from_config(config: Any) -> Any:
     )
 
 
-_ANN_FACTOR = 252
+_ANN_FACTOR = 244  # A股实际年化交易日数均值（非美股252）
 
 
 def _hac_sharpe_se_from_returns(

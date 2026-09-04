@@ -3,8 +3,123 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from loguru import logger
+
 from UtilsManager.ConfigParser import Config
 from BackTrading.domain.models import CostModel, DEFAULT_TRANSFER_FEE_SEGMENTS
+
+
+# ═══════════════════════════════════════════════════════════
+# P2.6 子配置类 — 按功能域分组，EngineConfig 通过 @property
+# 暴露子视图；直接字段访问 engine_cfg.xxx 保持向后兼容。
+# ═══════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class CostConfig:
+    """交易成本子配置 — 仅展示用，实际费用走 CostModel"""
+    commission_rate: float
+    stamp_tax_rate: float
+    slippage: float
+    transfer_fee_rate: float
+    transfer_fee_segments: tuple[tuple[str, float], ...]
+    min_commission_per_trade: float
+
+    @property
+    def buy_fee_simple(self) -> float:
+        return self.commission_rate + self.transfer_fee_rate
+
+    @property
+    def sell_fee_simple(self) -> float:
+        return self.commission_rate + self.transfer_fee_rate + self.stamp_tax_rate
+
+
+@dataclass(frozen=True)
+class ExecutionConfig:
+    """成交撮合子配置"""
+    execution_model: str
+    simulate_limit_up_down: bool
+    limit_seal_sell_ratio: float
+    limit_seal_buy_ratio: float
+    limit_tradable_up_ratio: float
+    limit_tradable_down_ratio: float
+    limit_intraday_ratio: float
+    limit_seal_decay: float
+    auction_fill_ratio: float
+    limit_ratio_mode: str
+    limit_calib_min_samples: int
+    resume_gap_up: float
+    resume_gap_down: float
+    resume_auction_fill_ratio: float
+    resume_impact_multiplier: float
+    max_order_pct: float
+    max_order_pct_high: float
+    max_order_pct_low: float
+    adv_amount_threshold_high: float
+    adv_amount_threshold_low: float
+    order_expiry_days: int
+    strict_listing_days: bool
+
+
+@dataclass(frozen=True)
+class PositionConfig:
+    """仓位控制子配置"""
+    initial_cash: float
+    max_position_pct: float
+    portfolio_method: str
+    atr_stop_mult: float
+    kelly_fraction: float
+    position_a: float
+    boll_narrow_ratio: float
+    cross_decay_days: int
+    risk_none_multiplier: float
+    max_holdings: int
+    buy_threshold: int
+    risk_per_trade: float
+    top_k: int
+
+
+@dataclass(frozen=True)
+class RegimeConfig:
+    """市场状态仓位调节子配置"""
+    regime_ret20_full: float
+    regime_ret20_half: float
+    regime_vol_pct_max: float
+    regime_full_multiplier: float
+    regime_half_multiplier: float
+    regime_min_multiplier: float
+
+
+@dataclass(frozen=True)
+class SuspensionConfig:
+    """停牌盯市子配置"""
+    susp_decay_start_days: int
+    susp_daily_decay_rate: float
+    susp_max_discount: float
+
+
+@dataclass(frozen=True)
+class OptimizerConfig:
+    """组合优化器子配置"""
+    optimizer_method: str
+    optimizer_risk_aversion: float
+    optimizer_turnover_penalty: float
+    optimizer_max_weight: float
+    optimizer_cov_lookback: int
+    optimizer_shrinkage: bool
+    optimizer_industry_neutral: bool
+    optimizer_industry_deviation: float
+    optimizer_max_holdings: int
+    optimizer_target_cash: float
+    optimizer_solve_timeout: float
+    optimizer_verbose: bool
+
+
+@dataclass(frozen=True)
+class MarketFilterConfig:
+    """市场过滤器子配置"""
+    market_filter_enabled: bool
+    market_filter_bull_ratio: float
+    market_filter_min_stocks: int
 
 
 @dataclass
@@ -22,7 +137,7 @@ class EngineConfig:
     max_position_pct: float = 0.1
     portfolio_method: str = "score_weighted"
     point_in_time: bool = True
-    atr_stop_mult: float = 1.5
+    atr_stop_mult: float = 2.5
     kelly_fraction: float = 0.25
     position_a: float = 0.3
     boll_narrow_ratio: float = 0.8
@@ -32,6 +147,13 @@ class EngineConfig:
     buy_threshold: int = 15  # 买入评分阈值
     min_commission_per_trade: float = 5.0  # A股每笔最低佣金 5 元
     cost_model: Any = None  # CostModel | None — forward ref to avoid circular import
+    # ── 市场过滤器（大盘风控开关） ──
+    market_filter_enabled: bool = False
+    market_filter_bull_ratio: float = 0.55  # >55%标的站上MA20视为牛市
+    market_filter_min_stocks: int = 10  # 最少有效标的数
+    
+    # ── ATR 风险驱动仓位控制（A4） ──
+    risk_per_trade: float = 0.02  # 单笔风险占总资金比例（默认2%）
     # ── 成交时点模型（0.1 执行时序合规） ──
     # next_open=信号次日开盘价成交（默认，符合A股T+1）
     # vwap=信号次日VWAP（成交额/成交量，后复权）成交。next_open/vwap 下单挂至次日开盘撮合，
@@ -138,6 +260,140 @@ class EngineConfig:
     # True = 输出所有 debug/info 日志；False = 仅输出 warning 以上级别
     optimizer_verbose: bool = False
 
+    # ── FIX(P1) Subtask-9：强制持有期限上限 ──
+    # 无止损保护（stop_col=NaN）时股票可能被永久持有，导致资金效率低。
+    # 持仓超过 max_hold_days 交易日后重新评估：若当前 buy_score 低于 buy_threshold → 卖出。
+    # 默认 60 个交易日（约一季度）；设为 0 表示关闭此限制。
+    max_hold_days: int = 60
+
+    # ── P2.6 子配置视图属性（不破坏 engine_cfg.xxx 直接访问兼容性） ──
+    @property
+    def cost(self) -> CostConfig:
+        """交易成本子配置视图"""
+        return CostConfig(
+            commission_rate=self.commission_rate,
+            stamp_tax_rate=self.stamp_tax_rate,
+            slippage=self.slippage,
+            transfer_fee_rate=self.transfer_fee_rate,
+            transfer_fee_segments=self.transfer_fee_segments,
+            min_commission_per_trade=self.min_commission_per_trade,
+        )
+
+    @property
+    def execution(self) -> ExecutionConfig:
+        """成交撮合子配置视图"""
+        return ExecutionConfig(
+            execution_model=self.execution_model,
+            simulate_limit_up_down=self.simulate_limit_up_down,
+            limit_seal_sell_ratio=self.limit_seal_sell_ratio,
+            limit_seal_buy_ratio=self.limit_seal_buy_ratio,
+            limit_tradable_up_ratio=self.limit_tradable_up_ratio,
+            limit_tradable_down_ratio=self.limit_tradable_down_ratio,
+            limit_intraday_ratio=self.limit_intraday_ratio,
+            limit_seal_decay=self.limit_seal_decay,
+            auction_fill_ratio=self.auction_fill_ratio,
+            limit_ratio_mode=self.limit_ratio_mode,
+            limit_calib_min_samples=self.limit_calib_min_samples,
+            resume_gap_up=self.resume_gap_up,
+            resume_gap_down=self.resume_gap_down,
+            resume_auction_fill_ratio=self.resume_auction_fill_ratio,
+            resume_impact_multiplier=self.resume_impact_multiplier,
+            max_order_pct=self.max_order_pct,
+            max_order_pct_high=self.max_order_pct_high,
+            max_order_pct_low=self.max_order_pct_low,
+            adv_amount_threshold_high=self.adv_amount_threshold_high,
+            adv_amount_threshold_low=self.adv_amount_threshold_low,
+            order_expiry_days=self.order_expiry_days,
+            strict_listing_days=self.strict_listing_days,
+        )
+
+    @property
+    def position(self) -> PositionConfig:
+        """仓位控制子配置视图"""
+        return PositionConfig(
+            initial_cash=self.initial_cash,
+            max_position_pct=self.max_position_pct,
+            portfolio_method=self.portfolio_method,
+            atr_stop_mult=self.atr_stop_mult,
+            kelly_fraction=self.kelly_fraction,
+            position_a=self.position_a,
+            boll_narrow_ratio=self.boll_narrow_ratio,
+            cross_decay_days=self.cross_decay_days,
+            risk_none_multiplier=self.risk_none_multiplier,
+            max_holdings=self.max_holdings,
+            buy_threshold=self.buy_threshold,
+            risk_per_trade=self.risk_per_trade,
+            top_k=self.top_k,
+        )
+
+    @property
+    def regime(self) -> RegimeConfig:
+        """市场状态仓位调节子配置视图"""
+        return RegimeConfig(
+            regime_ret20_full=self.regime_ret20_full,
+            regime_ret20_half=self.regime_ret20_half,
+            regime_vol_pct_max=self.regime_vol_pct_max,
+            regime_full_multiplier=self.regime_full_multiplier,
+            regime_half_multiplier=self.regime_half_multiplier,
+            regime_min_multiplier=self.regime_min_multiplier,
+        )
+
+    @property
+    def suspension(self) -> SuspensionConfig:
+        """停牌盯市子配置视图"""
+        return SuspensionConfig(
+            susp_decay_start_days=self.susp_decay_start_days,
+            susp_daily_decay_rate=self.susp_daily_decay_rate,
+            susp_max_discount=self.susp_max_discount,
+        )
+
+    @property
+    def optimizer(self) -> OptimizerConfig:
+        """组合优化器子配置视图"""
+        return OptimizerConfig(
+            optimizer_method=self.optimizer_method,
+            optimizer_risk_aversion=self.optimizer_risk_aversion,
+            optimizer_turnover_penalty=self.optimizer_turnover_penalty,
+            optimizer_max_weight=self.optimizer_max_weight,
+            optimizer_cov_lookback=self.optimizer_cov_lookback,
+            optimizer_shrinkage=self.optimizer_shrinkage,
+            optimizer_industry_neutral=self.optimizer_industry_neutral,
+            optimizer_industry_deviation=self.optimizer_industry_deviation,
+            optimizer_max_holdings=self.optimizer_max_holdings,
+            optimizer_target_cash=self.optimizer_target_cash,
+            optimizer_solve_timeout=self.optimizer_solve_timeout,
+            optimizer_verbose=self.optimizer_verbose,
+        )
+
+    @property
+    def market_filter(self) -> MarketFilterConfig:
+        """市场过滤器子配置视图"""
+        return MarketFilterConfig(
+            market_filter_enabled=self.market_filter_enabled,
+            market_filter_bull_ratio=self.market_filter_bull_ratio,
+            market_filter_min_stocks=self.market_filter_min_stocks,
+        )
+
+    # ── P2.6 防御性验证 ──
+    def validate(self) -> list[str]:
+        """验证配置一致性，返回问题列表（空列表 = 通过）"""
+        issues = []
+        if self.initial_cash <= 0:
+            issues.append("initial_cash 必须为正数")
+        if not (0 < self.max_position_pct <= 1.0):
+            issues.append("max_position_pct 应在 (0, 1] 范围")
+        if self.buy_threshold < 0:
+            issues.append("buy_threshold 不应为负数")
+        if self.simulate_limit_up_down and self.execution_model == "close":
+            issues.append("close 执行模式已移除（前视偏差），请改用 next_open/vwap")
+        if self.optimizer_cov_lookback < 30:
+            issues.append("optimizer_cov_lookback < 30 天，协方差估计极不可靠")
+        if self.susp_daily_decay_rate < 0 or self.susp_daily_decay_rate > 0.05:
+            issues.append("susp_daily_decay_rate 异常（建议范围 0~0.05）")
+        if issues:
+            logger.warning("[P2.6] EngineConfig 验证发现 {} 个问题: {}", len(issues), issues)
+        return issues
+
     @property
     def buy_fee_rate(self) -> float:
         """买入费率（不含滑点）：佣金 + 过户费。
@@ -168,9 +424,28 @@ from BackTrading.engine.core import (  # noqa: E402
     run_full_backtest,
 )
 
+# ── P1.1 重构：拆分模块导出（向后兼容） ──
+from BackTrading.engine.position_manager import (  # noqa: E402
+    PositionState,
+)
+from BackTrading.engine.cost_calculator import (  # noqa: E402
+    CostAccum,
+    CostCalculator,
+)
+from BackTrading.engine.execution_engine import (  # noqa: E402
+    AuctionFillConfig,
+    ExecutionEngine,
+)
+
 __all__ = [
     "EngineConfig",
     "run_full_backtest",
     "_run_single_backtest",
     "_MIN_SLIPPAGE_FLOOR",
+    # P1.1 拆分模块
+    "PositionState",
+    "CostAccum",
+    "CostCalculator",
+    "AuctionFillConfig",
+    "ExecutionEngine",
 ]

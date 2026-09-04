@@ -29,6 +29,13 @@ class ColumnNames:
     LATEST_PRICE = "最新价"
     STOCK_LINK = "股票链接"
 
+    # P2.5 修复：K线数据标准列名（Indicators/prepare 共用，消除魔法字符串）
+    CLOSE_NORMAL = "close_normal"  # 后复权价
+    CLOSE_ADJ = "close"            # 前复权价/原始收盘价
+    VOLUME_DATA = "volume"         # 成交量
+    MA_VOLUME_5 = "MA_Volume_5"   # 5日成交量均线
+    NAME_COL = "name"             # 股票名称
+
     # akshare原始列名（数据清洗阶段使用）
     AKSHARE_CODE_RAW = "代码"  # 主力成本等接口返回的原始列名
     AKSHARE_INDUSTRY_BOARD_NAME = "板块名称"

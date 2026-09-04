@@ -79,6 +79,21 @@ def create_main_cost_schema() -> DataFrameSchema:
     )
 
 
+def create_strategic_ranking_schema() -> DataFrameSchema:
+    """
+    P2.11 排名类数据 Schema（强势股池 / 连续上涨 / 量价齐升 / 持续放量 / 均线突破）
+
+    这些 akshare 接口返回结构相似：至少包含"股票代码"列。
+    strict=False 允许额外列（各接口返回字段不完全一致）。
+    """
+    return DataFrameSchema(
+        {
+            "股票代码": Column(str, nullable=False, coerce=True),
+        },
+        strict=False,
+    )
+
+
 def create_final_report_schema() -> DataFrameSchema:
     """
     最终分析报告 Schema
@@ -185,6 +200,21 @@ class SchemaValidator:
         """
         try:
             schema = create_final_report_schema()
+            schema.validate(df, lazy=lazy)
+            return True, []
+        except Exception as e:
+            return False, [str(e)]
+
+    # ── P2.11：排名类数据源（强势股池 / 连续上涨 / 量价齐升 / 持续放量 / 均线突破） ──
+    @staticmethod
+    def validate_strategic_ranking(df: pd.DataFrame, lazy: bool = True) -> tuple[bool, list[str]]:
+        """
+        P2.11 校验排名类数据源（强势股池 / 连续上涨 / 量价齐升 / 持续放量 / 均线突破）。
+
+        校验逻辑：确保至少包含"股票代码"列，允许其他接口差异列。
+        """
+        try:
+            schema = create_strategic_ranking_schema()
             schema.validate(df, lazy=lazy)
             return True, []
         except Exception as e:

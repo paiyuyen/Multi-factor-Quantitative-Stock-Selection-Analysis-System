@@ -42,7 +42,7 @@ def compute_risk_metrics(
         return {}
 
     total_ret = vals[-1] / vals[0] - 1
-    ann_factor = 252
+    ann_factor = 244  # A股实际年化交易日数均值（非美股 252）
     mu = returns.mean() * ann_factor
     sigma = returns.std(ddof=1) * math.sqrt(ann_factor)
 

@@ -254,23 +254,14 @@ def main() -> None:
         return
 
     while True:
-        raw_code = input("\n  请输入股票代码 (6位数字，如 000001): ").strip()
-        if not raw_code:
-            print("  [ERROR] 未输入股票代码")
+        raw_code = input("\n  请输入股票代码 (6位数字，如 000001，输入 quit 退出): ").strip()
+        if raw_code.lower() in ("quit", "q"):
+            print("  再见！")
+            break
+        if not raw_code.isdigit() or len(raw_code) != 6:
+            print(f"  [ERROR] 输入不合法: {raw_code!r} (需为 6 位数字或 quit)")
             continue
         analyze_stock(raw_code)
-        if not _ask_continue():
-            break
-
-
-def _ask_continue() -> bool:
-    """询问用户继续还是退出，输入 1 继续，其他输入退出"""
-    print("=" * WIDTH)
-    choice = input("  输入 1 继续分析，其他任意键退出: ").strip()
-    if choice == "1":
-        return True
-    print("  再见！")
-    return False
 
 
 if __name__ == "__main__":

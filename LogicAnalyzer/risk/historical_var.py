@@ -36,7 +36,7 @@ class HistoricalVaR:
     """历史模拟法 VaR / ES 计算器。"""
 
     DEFAULT_CONFIDENCE = DEFAULT_CONFIDENCE
-    TRADING_DAYS = 252  # A 股年化交易日数
+    TRADING_DAYS = 244  # A股实际年化交易日数均值（非美股252）
 
     # ── 数据清洗 ────────────────────────────────────────────
 

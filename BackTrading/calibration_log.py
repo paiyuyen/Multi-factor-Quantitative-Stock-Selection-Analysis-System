@@ -171,7 +171,11 @@ def should_rerun(
 
 
 def _pyval(v: Any) -> Any:
-    """numpy → 原生 Python 类型，避免 psycopg2 序列化成 np.float64(...) 导致 SQL 报错。"""
+    """numpy → 原生 Python 类型，避免 psycopg2 序列化成 np.float64(...) 导致 SQL 报错。
+
+    P2 修复：兜底逻辑改用 str() 替代 try/except json.dumps，覆盖更多不可序列化类型
+    （如 SQLAlchemy Engine、pandas DataFrame、自定义类等）。
+    """
     if isinstance(v, np.floating):
         return float(v)
     if isinstance(v, np.integer):
@@ -179,9 +183,15 @@ def _pyval(v: Any) -> Any:
     if isinstance(v, np.bool_):
         return bool(v)
     if isinstance(v, dict):
-        return {k: _pyval(v) for k, v in v.items()}
+        return {k: _pyval(val) for k, val in v.items()}
     if isinstance(v, (list, tuple)):
-        return type(v)(_pyval(x) for x in v)
+        return type(v)(_pyval(item) for item in v)
+    # FIX(P2) 兜底：json 不支持的类型 → 用 repr 而非 json.dumps 探测 + 直接 str(v) 转换
+    # 旧逻辑：try/except json.dumps(v) 在某些 C 扩展类型（如 SQLAlchemy Engine）
+    #   上可能抛出非 TypeError 异常（如 RuntimeError），导致未捕获崩溃。
+    # 新逻辑：对一切非标量/非容器直接 str(v) 降级。
+    if not isinstance(v, (str, int, float, bool, type(None))):
+        return f"<{type(v).__module__}.{type(v).__qualname__}: {str(v)[:120]}>"
     return v
 
 

@@ -167,8 +167,15 @@ class DataAcquisitionService:
                     is_valid, missing = self.data_validator.validate_required_columns(df, required_cols, desc)
 
                     if is_valid:
-                        logger.info(f"  - [OK] {desc}: {len(df)} 条记录")
-                        return key, df
+                        # P2.11: Pandera 数据契约校验（非阻塞，仅WARN）
+                        is_schema_valid, schema_errors = SchemaValidator.validate_strategic_ranking(df)
+                        if is_schema_valid:
+                            logger.info(f"  - [OK] {desc}: {len(df)} 条记录")
+                            return key, df
+                        else:
+                            logger.warning(f"  - [WARN] {desc} Pandera校验失败: {schema_errors}")
+                            logger.warning(f"  - [WARN] 继续使用{desc}数据，但请注意可能存在数据质量问题")
+                            return key, df
                     else:
                         logger.warning(f"  - [WARN] {desc} 缺少列: {missing}")
                         return key, pd.DataFrame()
@@ -216,8 +223,15 @@ class DataAcquisitionService:
                     is_valid, missing = self.data_validator.validate_required_columns(df, required_cols, desc)
 
                     if is_valid:
-                        logger.info(f"  - [OK] {desc}: {len(df)} 条记录")
-                        return key, df
+                        # P2.11: Pandera 数据契约校验（非阻塞，仅WARN）
+                        is_schema_valid, schema_errors = SchemaValidator.validate_strategic_ranking(df)
+                        if is_schema_valid:
+                            logger.info(f"  - [OK] {desc}: {len(df)} 条记录")
+                            return key, df
+                        else:
+                            logger.warning(f"  - [WARN] {desc} Pandera校验失败: {schema_errors}")
+                            logger.warning(f"  - [WARN] 继续使用{desc}数据，但请注意可能存在数据质量问题")
+                            return key, df
                     else:
                         logger.warning(f"  - [WARN] {desc} 缺少列: {missing}")
                         return key, pd.DataFrame()
@@ -296,6 +310,21 @@ class DataAcquisitionService:
         except (ValueError, TypeError, OSError, ImportError) as e:
             logger.error(f"  - [FAIL] 获取主力成本数据失败: {e}")
             data["main_cost_data"] = pd.DataFrame()
+
+        # P2.2：外部数据源交叉校验 — akshare vs asharehub OHLCV 偏差检测
+        try:
+            # 从已获取数据中提取候选股票代码清单
+            candidate_syms = set()
+            for key in ("market_fund_flow_raw", "market_fund_flow_raw_3", "strong_stocks_raw"):
+                df_src = data.get(key)
+                if df_src is not None and not df_src.empty and ColumnNames.STOCK_CODE in df_src.columns:
+                    candidate_syms.update(df_src[ColumnNames.STOCK_CODE].dropna().unique())
+            if candidate_syms:
+                from DataCollection.CrossSourceValidator import CrossSourceValidator
+                validator = CrossSourceValidator(self.config)
+                validator.cross_validate(list(candidate_syms), today_str)
+        except Exception as e:
+            logger.warning(f"[P2.2] 交叉校验异常（不影响主流程）: {e}")
 
         return data
 

@@ -74,7 +74,12 @@ INVALID_CASES = [
      _valid_df().assign(volume=0.0).assign(close=lambda d: d["close"].iloc[0]),  # 全零成交+全横盘
      "SUSPENSION_RATIO_HIGH"),
     ("adj_factor_jump",
-     _valid_df().assign(adj_factor=np.concatenate([np.full(100, 1.0), np.full(100, 1.12), np.full(100, 1.12)])),
+     # P1-9 审计修复：12% 向上跳变属正常除权。改为向下回溯跳变（数据源断裂/混用）
+     _valid_df().assign(adj_factor=np.concatenate([
+         np.full(100, 1.0),
+         np.full(100, 1.10),  # normal upward
+         np.full(100, 1.05)   # backward jump (1.10 → 1.05, < 0.99×previous)
+     ])),
      "ADJ_FACTOR_JUMP"),
     ("price_jump_volume_collapse",
      _valid_df().assign(close=lambda d: np.where(np.arange(len(d)) == 150, d["close"] * 1.6, d["close"]))

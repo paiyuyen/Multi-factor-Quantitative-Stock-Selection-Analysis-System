@@ -130,7 +130,7 @@ def _allocate_strategy_capital(
             vols[name] = 0.20
             continue
         returns = pd.Series([e["portfolio_value"] for e in ec]).pct_change().dropna()
-        vols[name] = max(returns.std() * np.sqrt(252), 0.01)
+        vols[name] = max(returns.std() * np.sqrt(244), 0.01)  # A股年化交易日244
 
     inv_vol = {k: 1.0 / v for k, v in vols.items()}
     total = sum(inv_vol.values()) or 1.0

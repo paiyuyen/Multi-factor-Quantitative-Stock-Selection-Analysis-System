@@ -294,12 +294,26 @@ def _check_adjust_jump(df: pd.DataFrame, p: PrecheckParams,
     if "adj_factor" in df.columns and len(df) >= 2:
         f = df["adj_factor"].to_numpy(dtype=float)
         valid = ~np.isnan(f)
+        # P1-9 审计修复：adj_factor 是累计因子，除权日正常向上跳变（5%~15%）。
+        # 3% 阈值会误报所有正常送转/配权事件，改为只检测**回溯跳变**（因子不应该减小）。
+        # 正常：f[t] >= f[t-1]；异常：f[t] < f[t-1] × 0.99 表示数据源断裂/混用。
         ratios = np.ones(len(f))
-        ratios[1:] = np.where(valid[1:] & valid[:-1], f[1:] / np.maximum(f[:-1], 1e-12), 1.0)
-        jumps = np.abs(ratios - 1.0) > 0.03
-        n_jumps = int(jumps.sum())
+        ratios[1:] = np.where(
+            valid[1:] & valid[:-1],
+            f[1:] / np.maximum(f[:-1], 1e-12),
+            1.0
+        )
+        # 仅检测向下异常跳变（< 99%），容忍正常除权上行跳变
+        jumps_backward = ratios < 0.99
+        n_jumps = int(jumps_backward.sum())
+        # 同时检测极端向上跳变（> 200%，通常为数据源混用或因子初始化错误）
+        jumps_extreme_up = ratios > 2.0
+        n_extreme = int(jumps_extreme_up.sum())
+        n_jumps += n_extreme
         metrics["adj_factor_jumps"] = n_jumps
         if n_jumps:
+            metrics["adj_factor_backward_jumps"] = int(jumps_backward.sum())
+            metrics["adj_factor_extreme_up_jumps"] = n_extreme
             findings.append(_Finding("ADJ_FACTOR_JUMP", PrecheckSeverity.LOW_CONFIDENCE, n_jumps))
         return
     # 无 adj_factor：量价跳变启发式（|回报| > 阈值 且 当日成交量塌缩 → 疑似未复权除权跳变）
@@ -336,33 +350,34 @@ def _check_first_day(df: pd.DataFrame, p: PrecheckParams,
 
 # ── 决策聚合 ──────────────────────────────────────────────────────────
 
-def _aggregate(findings: list[_Finding], mode: str, n_rows: int) -> PrecheckResult:
+def _aggregate(findings: list[_Finding], mode: str, n_rows: int,
+               metrics: dict[str, Any] | None = None) -> PrecheckResult:
     labels = list(dict.fromkeys(f.label for f in findings))  # 去重保序
-    metrics: dict[str, Any] = {}
+    agg_metrics = metrics if metrics is not None else {}
     for f in findings:
-        metrics.setdefault(f.label, f.metric)
+        agg_metrics.setdefault(f.label, f.metric)
 
     if mode == "OFF":
-        return PrecheckResult(status=PrecheckStatus.OK, reasons=[], metrics=metrics, mode=mode, n_rows=n_rows)
+        return PrecheckResult(status=PrecheckStatus.OK, reasons=[], metrics=agg_metrics, mode=mode, n_rows=n_rows)
     if n_rows < 1:
-        return PrecheckResult(status=PrecheckStatus.SKIP, reasons=["EMPTY_SERIES"], metrics=metrics, mode=mode, n_rows=n_rows)
+        return PrecheckResult(status=PrecheckStatus.SKIP, reasons=["EMPTY_SERIES"], metrics=agg_metrics, mode=mode, n_rows=n_rows)
 
     hard = [f for f in findings if f.severity == PrecheckSeverity.SKIP]
     if hard:
-        return PrecheckResult(status=PrecheckStatus.SKIP, reasons=labels, metrics=metrics, mode=mode, n_rows=n_rows)
+        return PrecheckResult(status=PrecheckStatus.SKIP, reasons=labels, metrics=agg_metrics, mode=mode, n_rows=n_rows)
     if mode == "STRICT":
         # 严格模式：任何可疑（可修复/软问题）一律拒绝
         if findings:
-            return PrecheckResult(status=PrecheckStatus.SKIP, reasons=labels, metrics=metrics, mode=mode, n_rows=n_rows)
-        return PrecheckResult(status=PrecheckStatus.OK, reasons=[], metrics=metrics, mode=mode, n_rows=n_rows)
+            return PrecheckResult(status=PrecheckStatus.SKIP, reasons=labels, metrics=agg_metrics, mode=mode, n_rows=n_rows)
+        return PrecheckResult(status=PrecheckStatus.OK, reasons=[], metrics=agg_metrics, mode=mode, n_rows=n_rows)
 
     fillable = [f for f in findings if f.severity == PrecheckSeverity.NEED_FILL]
     if fillable:
-        return PrecheckResult(status=PrecheckStatus.NEED_FILL, reasons=labels, metrics=metrics, mode=mode, n_rows=n_rows)
+        return PrecheckResult(status=PrecheckStatus.NEED_FILL, reasons=labels, metrics=agg_metrics, mode=mode, n_rows=n_rows)
     soft = [f for f in findings if f.severity == PrecheckSeverity.LOW_CONFIDENCE]
     if soft:
-        return PrecheckResult(status=PrecheckStatus.LOW_CONFIDENCE, reasons=labels, metrics=metrics, mode=mode, n_rows=n_rows)
-    return PrecheckResult(status=PrecheckStatus.OK, reasons=[], metrics=metrics, mode=mode, n_rows=n_rows)
+        return PrecheckResult(status=PrecheckStatus.LOW_CONFIDENCE, reasons=labels, metrics=agg_metrics, mode=mode, n_rows=n_rows)
+    return PrecheckResult(status=PrecheckStatus.OK, reasons=[], metrics=agg_metrics, mode=mode, n_rows=n_rows)
 
 
 # ── 核心 API ──────────────────────────────────────────────────────────
@@ -405,7 +420,7 @@ def precheck(
 
     if n_rows < p.min_rows:
         findings.append(_Finding("TOO_FEW_ROWS", PrecheckSeverity.SKIP, n_rows))
-        return _aggregate(findings, mode, n_rows)
+        return _aggregate(findings, mode, n_rows, metrics)
 
     _check_columns(ohlcv, findings, metrics)
     _check_non_nan(ohlcv, p, findings, metrics)
@@ -414,7 +429,7 @@ def precheck(
                       confirmed_suspension_days=confirmed_suspension_days)
     _check_adjust_jump(ohlcv, p, findings, metrics)
     _check_first_day(ohlcv, p, findings, metrics)
-    return _aggregate(findings, mode, n_rows)
+    return _aggregate(findings, mode, n_rows, metrics)
 
 
 # ── 容错执行 ──────────────────────────────────────────────────────────
@@ -471,6 +486,23 @@ def apply_precheck(
     Returns:
         (处理后 df, PrecheckResult)；df 为空表示调用方应跳过。
     """
+    # P1 防御性断言：非主板代码进入 precheck 时立即拦截（fail-fast）
+    _sym_clean = symbol.replace("sh", "").replace("sz", "")
+    if _sym_clean.startswith(("300", "688")) or (
+        len(_sym_clean) >= 1 and _sym_clean[0] in ("8", "4")
+    ):
+        skip_result = PrecheckResult(
+            status=PrecheckStatus.SKIP,
+            reasons=[f"NON_MAIN_BOARD_SYMBOL ({symbol})"],
+            metrics={},
+            n_rows=len(df_raw),
+        )
+        logger.warning(
+            f"[{symbol}] 预检 SKIP：非主板代码不应进入主板策略 precheck "
+            f"（RELAX 模式下仍拒绝）"
+        )
+        return pd.DataFrame(), skip_result
+
     result = precheck(df_raw, params, suspension_stats=suspension_stats,
                       confirmed_suspension_days=confirmed_suspension_days)
     mode = result.mode

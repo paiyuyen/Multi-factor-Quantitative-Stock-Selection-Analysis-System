@@ -1,6 +1,6 @@
 {
   "params": {
-    "atr_stop_mult": 1.0
+    "atr_stop_mult": 2.5
   },
   "score": 0.0,
   "sharpe": 0.0,

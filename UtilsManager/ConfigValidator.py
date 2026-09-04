@@ -420,7 +420,6 @@ SECTION_RULES: list[SectionRule] = [
         FieldRule("liquidity_tier_impact_base", "str", required=False, default="0.008,0.003,0.0015,0.001"),
         FieldRule("liquidity_tier_threshold", "str", required=False, default="0.005,0.01,0.01,0.02"),
         FieldRule("liquidity_tier_cap", "str", required=False, default="0.10,0.05,0.05,0.03"),
-        FieldRule("exclude_st", "bool", required=False, default="true"),
         FieldRule("max_position_pct", "float", required=False, default="0.1", min_value=0.01, max_value=1.0),
         FieldRule("max_order_pct", "float", required=False, default="0.30", min_value=0.01, max_value=1.0),
         FieldRule("max_order_pct_high", "float", required=False, default="0.20", min_value=0.01, max_value=1.0),

@@ -268,7 +268,14 @@ class StockAnalysisCoordinator:
             if not filtered_pure_codes:
                 self.logger.critical("同步历史数据后无有效股票代码，流程终止")
                 return False
+
+            # P0 合规过滤：复盘单元硬编码排除 ST/*ST 风险警示股
+            # 业务上不能推荐 ST 标的给投资者（合规风险/5%涨跌幅限制），
+            # 不复归 config 配置项控制，从源头杜绝误配风险。
+            filtered_pure_codes = self._filter_st_stocks(filtered_pure_codes)
+
             ctx.set("filtered_pure_codes", filtered_pure_codes)
+            self.logger.info(f"[复盘ST过滤] 过滤后剩余 {len(filtered_pure_codes)} 只股票参与复盘")
 
             # 同步因子数据
             if self.config.MULTI_FACTOR_ALPHA_ENABLED:
@@ -278,6 +285,60 @@ class StockAnalysisCoordinator:
         except Exception as e:
             self.logger.error(f"同步失败: {e}")
             return False
+
+    def _filter_st_stocks(self, stock_codes: set[str]) -> set[str]:
+        """从复盘股票池中硬编码排除今日处于 ST/退市状态的股票。
+
+        合规要求：不复归 config 控制，强制过滤。
+        数据源：stock_st_history PIT 表（按 today_str 查询 is_st 或 is_delisting 为真者）。
+        """
+        from sqlalchemy import text
+
+        if not stock_codes:
+            return stock_codes
+
+        try:
+            # 带市场前缀的 symbol 列表
+            prefixed = [CodeNormalizer.add_market_prefix(c) for c in stock_codes]
+
+            with self.db_engine.connect() as conn:
+                rows = conn.execute(text("""
+                    SELECT DISTINCT symbol
+                    FROM stock_st_history
+                    WHERE symbol = ANY(:syms)
+                      AND trade_date = :trade_date
+                      AND (is_st = TRUE OR is_delisting = TRUE)
+                """), {
+                    "syms": prefixed,
+                    "trade_date": self.today_str,
+                }).fetchall()
+
+            st_today = {str(r[0]) for r in rows}
+            if st_today:
+                # 归一化回 6 位纯数字做差集
+                st_pure = set()
+                for s in st_today:
+                    digits = s.replace("sh", "").replace("sz", "").replace("bj", "")
+                    if len(digits) == 6:
+                        st_pure.add(digits)
+                before = len(stock_codes)
+                stock_codes = stock_codes - st_pure
+                removed = before - len(stock_codes)
+                if removed:
+                    self.logger.info(
+                        f"[复盘ST过滤] 排除 {removed} 只 ST/退市标的"
+                        f"（{before} → {len(stock_codes)} 只）"
+                    )
+            else:
+                self.logger.debug(f"[复盘ST过滤] 今日无 ST 股票需要排除")
+
+        except Exception as e:
+            # PIT 表缺失不影响复盘流程，仅告警不阻断（保守放行）
+            self.logger.warning(
+                f"[复盘ST过滤] stock_st_history 查询失败，跳过 ST 过滤（可能向投资者包含 ST 标的）: {e}"
+            )
+
+        return stock_codes
 
     def _sync_factor_fetchers(self, stock_codes: set[str]) -> None:
         """同步估值/质量因子数据采集器。"""

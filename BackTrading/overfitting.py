@@ -11,7 +11,7 @@ from scipy import stats
 
 
 def _ann_factor() -> int:
-    return 252
+    return 244  # A股实际年化交易日数均值（非美股252）
 
 
 # OOS 最少交易日数：低于此样本量时 Sharpe 估计噪声过大，衰减比不可判定

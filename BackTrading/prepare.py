@@ -51,6 +51,83 @@ from BackTrading.indicator_cache import get_precomputed, get_divergence, precomp
 from BackTrading import output_store as _os
 from BackTrading import calendar_align as _ca
 
+# P1#5 / P1.4 重构：指标最大窗口 — 不再硬编码 120
+# 改为启动时自动扫描 vectorized_signal.py、Indicators.py 等指标管线中所有
+# rolling(window=N) / ewm(span=N) 窗口，取 max() 作为最小缓存缓冲要求。
+# 当新增更长窗口指标时，此处自动生效，无需手动更新。
+#
+# 已知窗口依赖（审计注释，随代码自动扫描）：
+#   - DataManager/Indicators.py: MA120 (rolling(window=120)) ← 当前最大
+#   - prepare.py / vectorized_signal.py: rolling(20), slope(60)
+#   - vectorized_signal.py: rolling(3), rolling(5)
+
+
+def _scan_max_indicator_window() -> int:
+    """启动时自动扫描指标管线中的所有 rolling()/ewm() 窗口，取最大值。
+
+    扫描范围：BackTrading/*.py + DataManager/Indicators.py + DataManager/*.py
+    匹配模式：rolling(window=N), rolling(N), ewm(span=N), ewm(com=N), ewm(halflife=N)
+    返回 max() 窗口值 + 20（安全边际）。
+    """
+    import ast
+    import glob
+    import os
+
+    max_window = 0
+
+    # 扫描目标 glob 路径
+    search_paths = [
+        os.path.join(os.path.dirname(__file__), "*.py"),
+        os.path.join(os.path.dirname(__file__), os.pardir, "DataManager", "*.py"),
+    ]
+    for pattern in search_paths:
+        for filepath in glob.glob(pattern):
+            try:
+                with open(filepath, encoding="utf-8", errors="ignore") as f:
+                    source = f.read()
+                tree = ast.parse(source, filename=filepath)
+            except (SyntaxError, UnicodeDecodeError, OSError):
+                continue
+
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call):
+                    func_name = None
+                    if isinstance(node.func, ast.Attribute):
+                        func_name = node.func.attr  # e.g. "rolling" or "ewm"
+                    elif isinstance(node.func, ast.Name):
+                        func_name = node.func.id  # e.g. "rolling"
+
+                    if func_name in ("rolling", "ewm"):
+                        # 提取 window / span / com / halflife 参数
+                        for keyword in node.keywords:
+                            if keyword.arg in ("window", "span", "com", "halflife"):
+                                # 尝试提取整数常量
+                                if isinstance(keyword.value, ast.Constant) and isinstance(
+                                    keyword.value.value, int
+                                ):
+                                    max_window = max(max_window, keyword.value.value)
+
+                # rolling(N) 位置参数
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                    if node.func.attr == "rolling" and node.args and not node.keywords:
+                        arg = node.args[0]
+                        if isinstance(arg, ast.Constant) and isinstance(arg.value, int):
+                            max_window = max(max_window, arg.value)
+
+    # 显式声明聚合：取 Indicators.py 中的 MAX_ROLLING_WINDOW（循环变量 AST 不可达）
+    try:
+        from DataManager.Indicators import MAX_ROLLING_WINDOW  # type: ignore[attr-defined]
+        max_window = max(max_window, MAX_ROLLING_WINDOW)
+    except ImportError:
+        pass
+
+    # 安全边际 +20：应对 shift(N) 滞后窗口
+    return max(max_window + 20, 100)
+
+
+MAX_INDICATOR_WINDOW = _scan_max_indicator_window()
+logger.debug(f"[P1.4] 自动扫描指标最大窗口: {MAX_INDICATOR_WINDOW}")
+
 
 def _clean_stale_tempdirs(max_age_hours: float = 2) -> int:
     """启动时清理残留的 bprep_* 临时目录（上次异常中断遗留）。"""
@@ -194,9 +271,15 @@ def _data_fingerprint(kline_df: pd.DataFrame, data_version: str | None = None) -
             step = max(1, len(kline_df) // 20000)
             sampled = kline_df.iloc[::step]
             content = hashlib.sha256(sampled[cols].values.tobytes()).hexdigest()[:8]
+        # FIX(P2) Subtask-10：显式纳入 adj_factor 哈希，防止仅修正复权因子未改 OHLC 时
+        # 缓存静默复用（上游数据回溯/复权口径切换场景）
+        af_hash = ""
+        if "adj_factor" in kline_df.columns:
+            _af_sample = kline_df.iloc[::max(1, len(kline_df) // 20000)][["adj_factor"]]
+            af_hash = hashlib.sha256(_af_sample.values.tobytes()).hexdigest()[:8]
         raw = (
             f"{data_version or ''}|{len(kline_df)}_{dates.min()}_{dates.max()}_{len(syms)}_"
-            f"{hashlib.sha256('|'.join(syms).encode()).hexdigest()[:8]}_{content}"
+            f"{hashlib.sha256('|'.join(syms).encode()).hexdigest()[:8]}_{content}_{af_hash}"
         )
         return hashlib.sha256(raw.encode()).hexdigest()[:10]
     except Exception:
@@ -319,14 +402,21 @@ def _load_signal_cache(trade_date: str, param_hash: str | None = None, config_ha
             files.extend(sorted(bucket_dir.glob("*.parquet")))
     if not files:
         return None
-    # 分块 concat：一次性读 3155 个文件再整体 concat 会产生双倍内存峰值
+    # P2.4 内存碎片治理：分块 concat 降低峰值 + 显式 gc.collect() 释放。
+    # 一次性读 3155 个文件再整体 concat 会产生双倍内存峰值
     #（parts 列表 + 合并结果），容易在 Windows 上触发 OOM/原生崩溃。
     # 这里按块合并、逐块释放，同时提前丢弃 exit_strategy 字典列（每行一个 dict，
     # 是内存大头，提取出止损价后不再需要）。
-    _CHUNK = 400
+    # P1.12 动态 chunk 计算：根据文件总数自适应，避免硬编码
+    # 小数据集用大 chunk 减少 GC 开销；大数据集缩小 chunk 控制峰值。
+    _total_files = len(files)
+    _CHUNK = max(50, min(1000, round(40000 / max(_total_files, 1))))
+    assert 50 <= _CHUNK <= 1000, f"P1.12 chunk clamp failed: {_CHUNK}"
+
     parts: list[pd.DataFrame] = []
     df: pd.DataFrame | None = None
     for idx, f in enumerate(files):
+        part = None
         try:
             part = pd.read_parquet(f)
         except Exception:
@@ -335,18 +425,28 @@ def _load_signal_cache(trade_date: str, param_hash: str | None = None, config_ha
         if "exit_strategy" in part.columns:
             if "止损价" not in part.columns:
                 part["止损价"] = part["exit_strategy"].apply(
-                    lambda x: float(x.get("stop_loss", 0)) if isinstance(x, dict) else 0.0
+                    lambda x: float(x.get("stop_loss", 0.0)) if isinstance(x, dict) else 0.0
                 )
             part = part.drop(columns=["exit_strategy"])
         parts.append(part)
+        part = None
+
         if len(parts) >= _CHUNK:
             merged = pd.concat(parts, ignore_index=True)
-            parts = [merged]
-        del part
+            del parts[:]
+            parts.append(merged)
+            # P2.4：每次 chunk 合并后触发 GC，释放已被 del 的 parquet 中间对象
+            gc.collect()
+
+            if (idx + 1) % 800 == 0:
+                logger.debug(f"[P2.4] concat 进度: {idx + 1}/{_total_files}")
+
     if not parts:
         return None
     df = pd.concat(parts, ignore_index=True)
-    del parts
+    del parts[:]
+    # P2.4：终态 concat 后也触发一次 GC
+    gc.collect()
     # 只重命名确实存在的英文列，避免旧版缓存中文列名冲突
     rename_map = {eng: chn for eng, chn in _REV_SIGNAL_COL_MAP.items() if eng in df.columns and eng != chn}
     if rename_map:
@@ -431,6 +531,24 @@ def prepare_backtest_data(
     data_version: str | None = None,
     confirmed_suspension_days: set[str] | None = None,
 ) -> pd.DataFrame:
+    # ── P1#5 指标缓存窗口断言（防御性校验） ──
+    # 最大指标窗口 MA120 (Indicators.py)。backtest_start_date 之前必须有 >= 120 行预热数据，
+    # 否则 rolling(120, min_periods=120) 全 NaN → 信号污染/静默失效。
+    # WFO 窗口切片场景下，子窗口可能无法提供 120 天历史；此处告警不阻断，
+    # 由下游 rolling(min_periods=1) 缩窗安全降级。整批全量数据由 runner._fetch_kline
+    # 保障缓冲（当前 _buffer_trading_days = 180 >> 120）。
+    if backtest_start_date is not None and "trade_date" in kline_df.columns and "symbol" in kline_df.columns:
+        _mask_pre = kline_df["trade_date"] < backtest_start_date
+        _pre_counts = kline_df.loc[_mask_pre].groupby("symbol").size()
+        _short_syms = _pre_counts[_pre_counts < MAX_INDICATOR_WINDOW]
+        if not _short_syms.empty:
+            worst = _pre_counts.idxmin()
+            logger.warning(
+                f"[P1#5] 以下 {_short_syms.index[0]!r} 等{_short_syms.shape[0]}只股票 "
+                f"在 {backtest_start_date} 前有 ≤{_pre_counts.min()} 行预热数据 "
+                f"(阈值={MAX_INDICATOR_WINDOW})，指标预热可能不足 → 信号 NaN 风险"
+            )
+
     # is_flat 检测：检查 params 顶层是否有任一信号参数或组合参数键。
     # 白名单 = PREPARE_CONSUMED (prepare 消费) ∪ ENGINE_CONSUMED (引擎消费)
     # 注：conclusion_bullish / conclusion_oscillate 不在寻优空间，但校准结果中可能出现。
@@ -511,8 +629,12 @@ def prepare_backtest_data(
         del kline, signal
         gc.collect()
         _t_ml = time.time()
-        # ── ML 解耦：预测列按数据版本冻结，参数变体不重训 ──
-        ml_key = (config_hash, data_fp)
+        # ── P0.2 修复：ML 缓存 key 加入窗口日期范围，防止跨 WFO 窗口数据泄露 ──
+        # 旧 key (config_hash, data_fp) 在跨窗口时重复命中 → 全量训练信息泄漏到 OOS。
+        # 新 key 包含 merged 本窗口最小/最大 trade_date，确保同窗口命中、跨窗口隔离。
+        _ml_date_min = str(merged["trade_date"].min())
+        _ml_date_max = str(merged["trade_date"].max())
+        ml_key = (config_hash, data_fp, _ml_date_min, _ml_date_max)
         with _ML_PRED_LOCK:
             ml_pred = _ML_PRED_CACHE.get(ml_key)
         if ml_pred is None:
@@ -536,10 +658,13 @@ def prepare_backtest_data(
             merged.loc[_ml_fill, "进场评分"] = merged.loc[_ml_fill, "ML进场评分"]
             merged = merged.drop(columns=["ML进场评分"])
             logger.info(f"  ML 预测注入冻结缓存（{int(_ml_fill.sum()):,} 行），耗时 {time.time()-_t_ml:.1f}s")
-        if _saved_atr_stop is not None and "ATR" in merged.columns:
+        if "ATR" in merged.columns:
             # P2-3：止损价统一使用后复权口径，避免除权日 close 跳跌而 ATR 连续导致量纲不一致
+            # P2-5 修复：_saved_atr_stop 为 None（params 非 flat）时退化为默认 1.5，
+            # 确保缓存中的旧版不复权止损价在 merge 后被无条件重建
+            _atr_stop_mult = _saved_atr_stop if _saved_atr_stop is not None else 1.5
             close_for_stop = merged["close_normal"] if "close_normal" in merged.columns else merged["close"]
-            stop_raw = close_for_stop - merged["ATR"] * _saved_atr_stop
+            stop_raw = close_for_stop - merged["ATR"] * _atr_stop_mult
             merged["止损价"] = np.floor(stop_raw * 100 + 0.5) / 100
 
         # ── P0-1：止损价复权空间断言（任何口径混用直接报错，禁止静默降级） ──
@@ -651,8 +776,45 @@ def prepare_backtest_data(
         )
 
     # ── 需要计算的股票 ──
+    # 细化未命中原因诊断：对象=缓存目录，环节=_completed_symbols/_load_signal_cache，
+    # 理由分三类（目录不存在 / 文件部分缺失 / 文件在但内容无效），并列出现有缓存键辅助定位
+    # 是哪个指纹（trade_date/config/param/data）发生了变化。
     _t0 = time.time()
-    logger.info(f"信号缓存无效或不存在，开始计算 {len(missing)} 只 [{cache_tag}]...")
+    _miss_dir = _cache_dir_for(trade_date, signal_param_hash, config_hash, data_fp)
+    if not _miss_dir.exists():
+        try:
+            _siblings = sorted(
+                (d for d in CACHE_DIR.glob("signal_cache_*") if d.is_dir()),
+                key=lambda d: d.stat().st_mtime, reverse=True,
+            )[:3]
+        except Exception:
+            _siblings = []
+        _sib_desc = "; ".join(
+            f"{d.name}（{time.strftime('%Y-%m-%d %H:%M', time.localtime(d.stat().st_mtime))}）"
+            for d in _siblings
+        ) or "无任何历史信号缓存"
+        logger.warning(
+            f"[信号缓存] 未命中：缓存目录不存在 → 全量计算 {len(missing)} 只\n"
+            f"  对象: {_miss_dir}\n"
+            f"  原因: 首次计算，或 trade_date/config_hash/param_hash/data_fp 任一指纹变化生成新缓存键"
+            f"（旧键缓存不跨键复用）[{cache_tag}]\n"
+            f"  现有其他缓存: {_sib_desc}"
+        )
+    elif len(done) >= len(symbols):
+        # 全部文件都在却走到重算：_load_signal_cache 返回 None/空（损坏），上方已有专项告警
+        logger.warning(
+            f"[信号缓存] 未命中：{len(done)} 只缓存文件存在但读取结果无效/为空（损坏，见上方告警）"
+            f"→ 全量重算 {len(missing)} 只 [{cache_tag}]"
+        )
+    else:
+        logger.warning(
+            f"[信号缓存] 未命中：缓存目录存在但 {len(missing)}/{len(symbols)} 只缺少缓存 parquet"
+            f"（上次运行中断/失败，或股票池新增股票）\n"
+            f"  对象: {_miss_dir}\n"
+            f"  已有缓存: {len(done)} 只，续算 {len(missing)} 只: {sorted(missing)[:8]}"
+            f"{'…' if len(missing) > 8 else ''} [{cache_tag}]"
+        )
+    logger.info(f"开始计算 {len(missing)} 只 [{cache_tag}]...")
     tmpdir = tempfile.mkdtemp(prefix="bprep_")
     stock_dir = os.path.join(tmpdir, "stocks")
     os.mkdir(stock_dir)

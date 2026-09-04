@@ -176,7 +176,7 @@ class TestHoldingPeriod:
 class TestMarketCycle:
     def _make_kline(self, start_year: int = 2020, n_years: int = 4, mix: str = "normal"):
         """生成含牛熊交替的 K 线数据。"""
-        dates = pd.bdate_range(start=f"{start_year}-01-01", periods=n_years * 252)
+        dates = pd.bdate_range(start=f"{start_year}-01-01", periods=n_years * 244)
         if mix == "normal":
             rets = np.random.RandomState(42).normal(0.0003, 0.015, len(dates))
         elif mix == "only_up":

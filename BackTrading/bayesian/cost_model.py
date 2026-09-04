@@ -105,7 +105,7 @@ class FidelityController:
         vectorized: bool = True,
         eval_start_date: str | None = None,
         st_history: dict | None = None,
-        exclude_st: bool = True,
+        exclude_st: bool = False,  # FIX(P0): 回测默认不排除 ST（复盘单元通过 coordinator.py 显式控制）
         data_version: str | None = None,
         listing_days: dict | None = None,
         db_engine: Any = None,
@@ -215,9 +215,10 @@ class FidelityController:
         # P0-6 ④：上市日期显式注入（与 runner 最终回测口径一致）
         if self._listing_days:
             engine_params["_listing_days"] = self._listing_days
-        # P1-4 行业映射：透传 db_engine 至引擎，启动时刷新 _industry_cache
+        # P1-4 行业映射：注入 db_engine_url 至引擎（FIX：用 URL 字符串替代 Engine 对象，
+        # 阻断 Engine 混入 best_params → json.dumps 崩溃）
         if self._db_engine is not None:
-            engine_params["_db_engine"] = self._db_engine
+            engine_params["_db_engine_url"] = str(self._db_engine.url)
         _t_b = time.perf_counter()
         total_return = _run_single_backtest(
             data, engine_params, eval_cfg, trade_log, equity_curve

@@ -103,18 +103,19 @@ class BenchmarkEvaluator:
         var_b = b_ret.var()
         beta = cov / var_b if var_b > 0 else 1.0
 
-        # 年化因子（假设日频数据）
+        # 年化因子（A股实际年化交易日数均值，非美股252）
+        _TRADING_DAYS = 244
         n = len(combined)
-        ann_factor = 252 / n if n > 0 else 252
-        ann_p = (1 + mean_p) ** 252 - 1
-        ann_b = (1 + mean_b) ** 252 - 1
+        ann_factor = _TRADING_DAYS / n if n > 0 else _TRADING_DAYS
+        ann_p = (1 + mean_p) ** _TRADING_DAYS - 1
+        ann_b = (1 + mean_b) ** _TRADING_DAYS - 1
 
         # Alpha（年化）
         alpha = (ann_p - risk_free_rate) - beta * (ann_b - risk_free_rate)
 
         # 夏普比率（年化）
-        excess_p = mean_p - risk_free_rate / 252
-        sharpe = (excess_p / std_p * np.sqrt(252)) if std_p > 0 else 0
+        excess_p = mean_p - risk_free_rate / _TRADING_DAYS
+        sharpe = (excess_p / std_p * np.sqrt(_TRADING_DAYS)) if std_p > 0 else 0
 
         # 最大回撤
         max_dd_p = self._max_drawdown(p_ret)
@@ -122,7 +123,7 @@ class BenchmarkEvaluator:
 
         # 跟踪误差（年化）
         diff = p_ret - b_ret
-        tracking_error = diff.std() * np.sqrt(252)
+        tracking_error = diff.std() * np.sqrt(_TRADING_DAYS)
 
         # 信息比率
         info_ratio = (mean_p - mean_b) / diff.std() if diff.std() > 0 else 0

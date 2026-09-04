@@ -57,6 +57,12 @@ if not HAVE_CVXPY:
     logger.warning(
         "[PortfolioOptimizer] cvxpy 不可用（DLL 加载失败或未安装），将回退至 scipy SLSQP。"
     )
+    logger.warning(
+        "[PortfolioOptimizer] ★★★ 求解器降级告警 ★★★\n"
+        "  SLSQP 为局部搜索求解器，L1 正则化下目标函数非凸 → 结果可能非全局最优。\n"
+        "  建议安装 cvxpy（pip install cvxpy）或确认 Windows 系统级 VC++ Redistributable 已安装。\n"
+        "  本次优化结果仅供参考，不保证组合风险预算约束被精确满足。"
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -98,11 +104,10 @@ class OptimizerConfig:
     # 协方差收缩 (Ledoit-Wolf, 小样本稳健)
     shrinkage: bool = True
 
-    # 最小候选数 (不足则回退 Top-K 等权)
-    min_candidates: int = 5
-
-    # 最小样本数 (收益率矩阵行数 < 此值回退)
-    min_samples: int = 10
+    # P0.7 修复：样本量低于 min_samples 时使用 Ledoit-Wolf 收缩，
+    #       低于 min_samples/3 时 fallback 等权并标记协方差降级。
+    cov_shrink: float = 0.5
+    cov_shrink_threshold: int = 30  # 低于此行数强制收缩协方差
 
     # 最大持仓数 (0 = 不限制)
     max_holdings: int = 0
@@ -224,20 +229,39 @@ class CovarianceEstimator:
         Returns:
             (N, N) 协方差矩阵 (确保正定)
         """
-        # P1-3 修复：EWMA 与 Ledoit-Wolf 收缩组合使用
-        # 先用 method 计算基础协方差，再可选叠加收缩增强稳健性
-        if method == "ewma":
-            cov = cls.ewma(returns, lam)
-        elif method == "ledoit_wolf":
+        T, N = returns.shape
+        # P0.7 修复：小样本协方差估计守卫 + 自动收缩
+        if T < N:
+            logger.warning(
+                f"[CovarianceEstimator] 样本量严重不足 (T={T} < N={N})，"
+                f"协方差矩阵必然奇异 → 强制使用 Ledoit-Wolf 收缩估计"
+            )
             cov = cls.ledoit_wolf(returns)
+        elif T < 60:
+            # 样本量偏低（低于默认 cov_lookback=120），启用自动收缩
+            logger.warning(
+                f"[CovarianceEstimator] 样本量偏低 (T={T} < 60)，"
+                f"协方差估计不稳定 → 启用 Ledoit-Wolf 收缩加固"
+            )
+            cov = cls.ledoit_wolf(returns)
+            # 再用基础估计做加权混合（收缩为主）
+            base_cov = cls.sample(returns)
+            cov = 0.4 * base_cov + 0.6 * cov
         else:
-            cov = cls.sample(returns)
+            # P1-3 修复：EWMA 与 Ledoit-Wolf 收缩组合使用
+            # 先用 method 计算基础协方差，再可选叠加收缩增强稳健性
+            if method == "ewma":
+                cov = cls.ewma(returns, lam)
+            elif method == "ledoit_wolf":
+                cov = cls.ledoit_wolf(returns)
+            else:
+                cov = cls.sample(returns)
 
-        # 若启用收缩且未使用 ledoit_wolf，则对基础估计再叠加收缩
-        if shrinkage and method != "ledoit_wolf":
-            shrunk = cls.ledoit_wolf(returns)
-            # 以基础估计为主，收缩估计为稳健锚，加权平均
-            cov = 0.7 * cov + 0.3 * shrunk
+            # 若启用收缩且未使用 ledoit_wolf，则对基础估计再叠加收缩
+            if shrinkage and method != "ledoit_wolf":
+                shrunk = cls.ledoit_wolf(returns)
+                # 以基础估计为主，收缩估计为稳健锚，加权平均
+                cov = 0.7 * cov + 0.3 * shrunk
 
         # 确保正定 (最小特征值平移)
         eigvals = np.linalg.eigvalsh(cov)
@@ -273,6 +297,7 @@ class PortfolioOptimizer:
 
     def __init__(self, config: OptimizerConfig | None = None) -> None:
         self.cfg = config or OptimizerConfig()
+        self._last_risk_model_fallback: bool = False  # P1.18: scipy fallback 可追踪标记
 
     # ── 主入口 ──────────────────────────────────────────────
 
@@ -379,7 +404,19 @@ class PortfolioOptimizer:
                 return result
 
         # CVXPY 失败或未安装 → scipy 回退
-        logger.debug("[Optimizer] CVXPY 不可用或失败，回退 scipy SLSQP")
+        if not HAVE_CVXPY and n > 10:
+            logger.warning(
+                f"[Optimizer] CVXPY 不可用 ({n} 只候选)，回退 scipy SLSQP；"
+                f"高维约束求解可靠性降低，建议使用凸规划求解器"
+            )
+        # P1.15 修复：CVXPY 失败回退时显式 WARN 告警（含行业中性约束静默放宽风险）
+        # 原 logger.debug 掩盖了 SLSQP 局部最优导致行业中性约束可能失效的问题
+        logger.warning(
+            f"[Optimizer] CVXPY 不可用或失败，回退 scipy SLSQP（{n} 只候选）→ "
+            f"行业中性约束可能未严格满足（局部最优近似）"
+        )
+        # P1.18 修复：标记 scipy fallback 供下游追踪验证
+        self._last_risk_model_fallback = True
         return self._mean_variance_scipy(
             symbols, mu, cov, w0, target_sum,
             industry_groups, benchmark_weights,
@@ -409,7 +446,7 @@ class PortfolioOptimizer:
         # P1-4 修复：融券成本项 — 对负权重部分加收年化融券成本（折算为日成本）
         short_cost_term = cp.Constant(0.0)
         if self.cfg.short_allowed:
-            short_cost_daily = self.cfg.short_cost_annual / 252.0
+            short_cost_daily = self.cfg.short_cost_annual / 244.0  # A股年化交易日244
             w_neg = cp.maximum(-w, 0)
             short_cost_term = short_cost_daily * cp.sum(w_neg)
 
@@ -513,7 +550,7 @@ class PortfolioOptimizer:
             turnover = self.cfg.turnover_penalty * np.sum(np.abs(w - w0))
             # P1-4 修复：融券成本项（日成本）
             if self.cfg.short_allowed:
-                short_cost_daily = self.cfg.short_cost_annual / 252.0
+                short_cost_daily = self.cfg.short_cost_annual / 244.0  # A股年化交易日244
                 short_pos = np.minimum(w, 0)
                 return return_term + risk_term + turnover + short_cost_daily * np.sum(np.abs(short_pos))
             return return_term + risk_term + turnover
@@ -581,6 +618,24 @@ class PortfolioOptimizer:
             w_opt[w_opt < 0.001] = 0
             if w_opt.sum() > 0:
                 w_opt = w_opt / w_opt.sum() * target_sum
+
+            # 回退模式权重后约束验证
+            if np.any(w_opt < -1e-9):
+                logger.warning(
+                    f"[Optimizer] SLSQP回退产生负权重，强制截断 "
+                    f"(min_weight={w_opt.min():.6f})"
+                )
+                w_opt = np.clip(w_opt, 0, None)
+                if w_opt.sum() > 0:
+                    w_opt = w_opt / w_opt.sum() * target_sum
+            abs_sum_err = abs(w_opt.sum() - target_sum)
+            if abs_sum_err > 1e-4:
+                logger.warning(
+                    f"[Optimizer] SLSQP回退权重Σw={w_opt.sum():.6f}偏离目标{target_sum} "
+                    f"(Δ={abs_sum_err:.6f})，重新归一化"
+                )
+                w_opt = w_opt / w_opt.sum() * target_sum
+
             return dict(zip(symbols, w_opt))
 
         logger.warning(
@@ -644,6 +699,13 @@ class PortfolioOptimizer:
 
         # scipy 回退
         from scipy.optimize import minimize
+
+        # P1.18 修复：标记 scipy fallback 供下游验证
+        self._last_risk_model_fallback = True
+        logger.debug(
+            f"[Optimizer] 最小方差 scipy SLSQP 回退（{n} 只候选）→ "
+            f"risk_model_fallback=True"
+        )
 
         def obj_func(w_vec: np.ndarray) -> float:
             return (w_vec @ cov @ w_vec
@@ -715,7 +777,13 @@ class PortfolioOptimizer:
             except Exception:
                 pass
 
-        # 梯度迭代法 (经典实现)
+        # 梯度迭代法 (经典实现) — CVXPY 不可用时回退
+        # P1.18 修复：标记 risk_model_fallback 供下游追踪验证
+        self._last_risk_model_fallback = True
+        logger.debug(
+            f"[Optimizer] 风险平价梯度迭代回退（{n} 只候选）→ "
+            f"risk_model_fallback=True，无凸规划保障"
+        )
         x = np.ones(n) / n
         for _ in range(200):
             sigma = np.sqrt(x @ cov @ x)

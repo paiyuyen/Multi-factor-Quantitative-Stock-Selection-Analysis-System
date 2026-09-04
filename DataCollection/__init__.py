@@ -6,4 +6,6 @@
 """
 
 from DataCollection.CalendarManager import TradingCalendarAnalyzer
-__all__ = ["TradingCalendarAnalyzer"]
+from DataCollection.CrossSourceValidator import CrossSourceValidator
+
+__all__ = ["TradingCalendarAnalyzer", "CrossSourceValidator"]

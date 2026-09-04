@@ -113,7 +113,7 @@ def _oos_validate(
     top_m: int = 5,
     eval_start_date: str | None = None,
     st_history: dict | None = None,
-    exclude_st: bool = True,
+    exclude_st: bool = False,  # FIX(P0): 回测默认不排除 ST
     data_version: str | None = None,
     listing_days: dict | None = None,
     db_engine: Any = None,
@@ -162,9 +162,9 @@ def _oos_validate(
         # P0-6 ④：上市日期显式注入（与 runner 最终回测口径一致）
         if listing_days:
             engine_params["_listing_days"] = listing_days
-        # P1-4 行业映射：透传 db_engine 至引擎
+        # P1-4 行业映射：注入 db_engine_url 至引擎（FIX：用 URL 字符串替代 Engine 对象）
         if db_engine is not None:
-            engine_params["_db_engine"] = db_engine
+            engine_params["_db_engine_url"] = str(db_engine.url)
         _run_single_backtest(_prepared, engine_params, _ec, tl, ec)
         risk = compute_risk_metrics(ec) or {}
         trade = compute_trade_metrics(tl) or {}
@@ -353,11 +353,37 @@ def bayesian_walk_forward_multi(
     except Exception as _pce:
         logger.warning(f"  Precheck 摘要计算失败（不影响主流程）: {_pce}")
     show_progress = kwargs.get("show_progress", False)
-    # ST/退市逐日动态剔除（runner 注入，寻优与最终回测口径一致）
+    # ST/退市逐日状态（runner 注入；回测阶段默认不排除 ST，防止 train/serve skew）
     st_history = kwargs.get("st_history")
-    exclude_st = bool(kwargs.get("exclude_st", True))
+    exclude_st = bool(kwargs.get("exclude_st", False))  # FIX(P0): 回测默认不排除 ST
     # P0-6 ④：上市日期显式注入（与 runner 最终回测口径一致）
     listing_days = kwargs.get("listing_days")
+
+    # P1.17 修复：WFO 窗口起始日期需动态延迟，避免新股数据不足导致指标预热失败。
+    # 策略：基于 listing_days 计算有效起始日期 — 取 90% 分位上市日 + _SIGNAL_WARMUP_DAYS，
+    # 确保绝大多数新股在进入第一个训练窗口前已有足够预热数据。
+    # 若 listing_days 缺失或上市日数据不足，回退至原有固定偏移。
+    _listing_offset = 0  # 全局偏移 bar 数
+    if listing_days:
+        # 过滤：上市日需在 unique_dates 范围内
+        _ipo_dates = [ld for ld in listing_days.values() if ld in unique_dates]
+        if len(_ipo_dates) >= 5:
+            _ipo_sorted = sorted(_ipo_dates)
+            _pct90_idx = max(0, int(len(_ipo_sorted) * 0.9) - 1)
+            _latest_ipo = _ipo_sorted[_pct90_idx]
+            # 计算延迟：从 latest_ipo + warmup 起算第一个交易日索引
+            _safe_start_str = _latest_ipo + pd.Timedelta(days=_SIGNAL_WARMUP_DAYS + 365).strftime("%Y-%m-%d")[:10]
+            _safe_start_str = _safe_start_str.split("T")[0][:10]
+            matching_idx = [i for i, d in enumerate(unique_dates) if d >= _safe_start_str]
+            if matching_idx:
+                _listing_offset = matching_idx[0]
+                logger.info(
+                    f"  P1.17 窗口起始动态延迟: 基于 90% 分位上市日 {_latest_ipo}，"
+                    f"窗口起始偏移 {_listing_offset} 个交易日（跳过早期新股不足窗口）"
+                )
+    else:
+        logger.debug("  P1.17: listing_days 缺失，使用固定窗口起始偏移")
+
     # P1-4 行业映射：透传 db_engine 至引擎
     db_engine = kwargs.get("db_engine")
 
@@ -367,7 +393,8 @@ def bayesian_walk_forward_multi(
 
     for path_idx in range(num_paths):
         # 确定性偏移：各路径互不重叠，避免 IS/OOS 数据泄露
-        offset = path_idx * test_period
+        # P1.17 修复：路径 offset 叠加上市日动态偏移，跳过早期新股不足窗口
+        offset = path_idx * test_period + _listing_offset
         _span = train_period + test_period + embargo_days  # purge 仅缩训练尾部，不占额外天数
         # WFO 寻参上界受 holdout 限制（末段禁触）；无 holdout 时回退 n_dates
         _wfo_cap = wfo_max_idx if wfo_max_idx is not None else n_dates

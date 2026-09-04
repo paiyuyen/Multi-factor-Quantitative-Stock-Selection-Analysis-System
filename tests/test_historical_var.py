@@ -48,7 +48,7 @@ def test_annualized_vol() -> None:
     r = _returns(sigma=0.03)
     res = HistoricalVaR().compute(r)
     # 样本标准差存在抽样误差（n=5000，se≈σ/√(2n)≈0.03%），放宽到 1% 相对误差
-    assert res["年化波动"] == pytest.approx(0.03 * np.sqrt(252), rel=0.01)
+    assert res["年化波动"] == pytest.approx(0.03 * np.sqrt(244), rel=0.01)
 
 
 def test_rolling_series() -> None:
