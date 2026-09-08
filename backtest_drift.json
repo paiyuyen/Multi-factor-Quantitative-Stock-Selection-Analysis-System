@@ -47,5 +47,38 @@
     "time": "2026-09-02T06:36:21.895460",
     "snapshot_id": "8dc84f67661b8842",
     "error_code": "PIPELINE_FAILED"
+  },
+  {
+    "type": "failure",
+    "error": "退市股覆盖率门禁: 退市股覆盖率仅 0.0% （0 / 3144 < 5%），回测结果可能因生存偏差而系统性高估。请扩展数据同步范围以包含退市标的历史 K 线。",
+    "time": "2026-09-05T04:33:59.698854",
+    "snapshot_id": "0f1eff61304ec797",
+    "error_code": "PIPELINE_FAILED"
+  },
+  {
+    "type": "failure",
+    "error": "退市股覆盖率门禁: 退市股覆盖率仅 0.0% （0 / 3144 < 5%），回测结果可能因生存偏差而系统性高估。请扩展数据同步范围以包含退市标的历史 K 线。",
+    "time": "2026-09-05T05:14:56.148805",
+    "snapshot_id": "7a6ce9843d4ee52d",
+    "error_code": "PIPELINE_FAILED"
+  },
+  {
+    "type": "failure",
+    "error": "[adj_factor异常] 2026-07-01 sh600667: ratio=0.997925 (4.7207 → 4.7109)，adj_factor 应为后复权因子且除权日后因子跳升；若ratio≤1，可能误用了前复权因子，将导致持仓股数缩水（严重错误）。",
+    "time": "2026-09-06T07:27:05.176183",
+    "snapshot_id": "68eb77112d16a72f",
+    "error_code": "PIPELINE_FAILED"
+  },
+  {
+    "type": "drift",
+    "time": "2026-09-08T13:33:41.156323",
+    "drifts": [
+      {
+        "param": "atr_stop_mult",
+        "old": 2.5,
+        "new": 5.5,
+        "drift_pct": 120.0
+      }
+    ]
   }
 ]

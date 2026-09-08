@@ -138,6 +138,8 @@ class EngineConfig:
     portfolio_method: str = "score_weighted"
     point_in_time: bool = True
     atr_stop_mult: float = 2.5
+    take_profit_pct: float = 15.0        # P2: 跟踪止盈目标浮盈百分比（默认 15%）
+    trail_profit_ratio: float = 50.0     # P2: 止盈回撤比例（从最高点回撤 50% 触发）
     kelly_fraction: float = 0.25
     position_a: float = 0.3
     boll_narrow_ratio: float = 0.8

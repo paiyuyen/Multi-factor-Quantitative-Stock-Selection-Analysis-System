@@ -97,7 +97,6 @@ CALIBRATION_FILE = PROJECT_ROOT / "calibration_result.json"
 CONFIG_INI = PROJECT_ROOT / "config.ini"
 
 # 写入 config.ini 时需取整的整数参数
-# P0-7 ②：补齐 buy_threshold/max_holdings —— 此前缺失导致以 "17.0" 浮点落盘，
 # 一旦加载端 int() 解析即崩溃；现强制整值落盘（写入前另有类型断言）。
 _INT_KEYS = frozenset({
     "cross_decay_days", "conclusion_full_bull",

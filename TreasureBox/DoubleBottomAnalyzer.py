@@ -360,7 +360,7 @@ class MACDKDJDoubleBottomAnalyzer:
 
                     # 构建SQL查询 (使用 amount 替代 vol)
                     query = """
-                    SELECT trade_date, symbol, "open", "close", high, low, amount, close_normal, adj_ratio
+                    SELECT trade_date, symbol, "open", "close", high, low, amount, close_normal, adj_factor
                     FROM stock_daily_kline
                     WHERE symbol = %s
                     """

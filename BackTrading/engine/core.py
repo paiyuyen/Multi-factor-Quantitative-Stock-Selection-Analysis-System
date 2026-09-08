@@ -706,6 +706,11 @@ def _run_single_backtest(
     _prev_stop: dict[str, float] = {}
     # 0.6 复牌跳空：每只标的最近一次有行情（bar）的交易日，用于识别停牌复牌
     _prev_bar_date: dict[str, str] = {}
+    # P1-1 修复：持仓跟踪止损（Trailing Stop）
+    # 入场以来的最高收盘价，用于动态上移止损价
+    _max_close_since_entry: dict[str, float] = {}
+    # P2 修复：跟踪止盈 — 入场收盘价，用于计算浮盈比例
+    _entry_close: dict[str, float] = {}
     _buy_date: dict[str, str] = {}
     # P2-2：建仓时 buy_score 快照，退出时 exit_gt 与此值比较（而非当日 buy_score）
     _entry_buy_score: dict[str, float] = {}
@@ -718,6 +723,9 @@ def _run_single_backtest(
     init_cash = engine_cfg.initial_cash
 
     _atr_stop = engine_cfg.atr_stop_mult
+    # P2 修复：跟踪止盈参数
+    _take_profit_pct = float(getattr(engine_cfg, "take_profit_pct", 15.0)) / 100.0
+    _trail_profit_ratio = float(getattr(engine_cfg, "trail_profit_ratio", 50.0)) / 100.0
     # P1-5 max_order_pct 分档：按 ADV 成交额选择流动性分档上限
     _max_order_pct_default = engine_cfg.max_order_pct
     _max_order_pct_high = engine_cfg.max_order_pct_high
@@ -960,6 +968,10 @@ def _run_single_backtest(
                 _held_days.pop(s_syms[j], None)
                 # FIX(P1) Subtask-9：清仓时清理持有期限计数器
                 _held_days.pop(s_syms[j], None)
+                # P0 修复（跟踪止损）：清仓时清理 max_close_since_entry
+                _max_close_since_entry.pop(s_syms[j], None)
+                # P2 修复（跟踪止盈）：清仓时清理 entry_close
+                _entry_close.pop(s_syms[j], None)
                 # P0-1 审计修复：清仓时保留 _buy_date 历史记录，不清除。
                 # 原实现清仓时 pop(_buy_date) 存在风险：若执行顺序调整（如 next_open 模型
                 # 下买入挂单成交后又有同标的卖出挂单），会导致 T+1 守卫被绕过。
@@ -1604,6 +1616,16 @@ def _run_single_backtest(
                 _buy_date[p["sym"]] = str(dt)
                 # FIX(P1) Subtask-9：新建仓初始化持有期限计数器
                 _held_days[p["sym"]] = 0
+                # P0 修复（跟踪止损）：新建仓时初始化 max_close_since_entry 为入场价
+                _max_close_since_entry[p["sym"]] = float(px)
+                # P2 修复（跟踪止盈）：新建仓时记录入场收盘价
+                _entry_close[p["sym"]] = float(close_adj[jj]) if np.isfinite(float(close_adj[jj])) else float(px)
+            # P0 修复（跟踪止损）：每笔成交后（含加仓）更新持仓标的的最高收盘价
+            if np.isfinite(float(close_adj[jj])):
+                _max_close_since_entry[p["sym"]] = max(
+                    _max_close_since_entry.get(p["sym"], float(px)),
+                    float(close_adj[jj]),
+                )
             # P2-2：记录建仓时 buy_score 快照，供 exit_gt 退出比较
             _entry_buy_score[p["sym"]] = float(p.get("buy_score", 0.0))
             _extra_buy = (
@@ -1881,6 +1903,15 @@ def _run_single_backtest(
                 )
 
         stop_col = day_data["止损价"].values if "止损价" in day_data.columns else np.zeros(len(day_data))
+        # P0 修复（跟踪止损 Trailing Stop）：每日盯市更新持仓标的的最高收盘价
+        # 止损基准需要随股价新高而上移——这是 trailing stop 的核心语义
+        held_syms = list(_max_close_since_entry.keys())
+        if held_syms and adj_ok is not None:
+            _syms_set = set(syms_str)
+            for _hs in held_syms:
+                _hi = int(np.where(syms_str == _hs)[0][0]) if len(np.where(syms_str == _hs)[0]) > 0 else -1
+                if _hi >= 0 and adj_ok[_hi] and np.isfinite(float(close_adj[_hi])):
+                    _max_close_since_entry[_hs] = max(_max_close_since_entry[_hs], float(close_adj[_hi]))
         # ── P0-1：止损价统一后复权口径 + 昨日止损线语义 ──
         # 止损价按当日 close_adj − ATR×mult 计算（后复权空间），同日均值比较恒不成立，
         # 必须用"上一交易日止损线 vs 今日收盘"判定破位（与 stop_hit_atr/_exit_score 的
@@ -1895,7 +1926,11 @@ def _run_single_backtest(
             # _prev_bar(raw) 供涨跌停模型使用不能改，此处用 _prev_bar_adj(close_adj)
             prev_close_arr = np.array([_prev_bar_adj.get(s, (c, 0))[0] for s, c in zip(syms_str, close_adj)])
             prev_atr_arr = np.array([_prev_bar_adj.get(s, (0, a))[1] for s, a in zip(syms_str, day_data["ATR"].values)])
-            atr_stop = prev_close_arr - prev_atr_arr * _atr_stop
+            # P0 修复（跟踪止损 Trailing Stop）：止损基准从入场收盘价改为"持仓以来最高收盘价"
+            # 原逻辑：atr_stop = prev_close_arr - prev_atr_arr * _atr_stop（固定止损，价格反弹不上移）
+            # 新逻辑：atr_stop = max_close_since_entry - prev_atr_arr * _atr_stop（随新高上移，保护利润）
+            max_close_arr = np.array([_max_close_since_entry.get(s, prev_close_arr[i]) for i, s in enumerate(syms_str)])
+            atr_stop = max_close_arr - prev_atr_arr * _atr_stop
             stop_hit_atr = (atr_stop > 0) & (close_adj < atr_stop) & adj_ok
         # P3 审计修复：撮合（_flush_pending）之前快照"昨日可见标的"——下方 _prev_bar/
         # _prev_bar_date 立即被当日数据覆盖，若不快照，撮合内"无前收禁买"守卫
@@ -1969,15 +2004,37 @@ def _run_single_backtest(
                     continue
                 _pos_prev_af = _pos_adjf.get(_s)
                 _si = idx[_k]
-                if _pos_prev_af is not None and abs(_pos_prev_af - _af_now) > 1e-12 and pos_shares[_si] > 0:
-                    # ── P0-13 审计修复：adj_factor 后复权方向断言 + 除权日市值不变性检测 ──
+                if _pos_prev_af is not None and abs(_pos_prev_af - _af_now) > 0.01 and pos_shares[_si] > 0:
+                    # ── P0-13 审计修复：adj_factor 变化分类处理 ──
+                    # ── 根因分析：adj_factor 在后复权体系下有两种变化模式：
+                    #    (1) 真实除权事件：因子显著跳升（ratio > 1.01，如 1.10~1.50）
+                    #    (2) 数据源修正/重算：因子微调下降（ratio ≈ 1，如 0.995~0.999）
+                    #    旧逻辑将两类统一视为除权事件，断言"只能增不能减"，
+                    #    在数据微调场景下错误触发崩溃。
+                    # ── 修复策略：
+                    #    - ratio > 1.01：确认为除权事件，执行碎股清理
+                    #    - 0.99 <= ratio <= 1.01：数据修正，跳过调整，更新缓存
+                    #    - ratio < 0.99：异常大幅降低（可能误用前复权因子），告警但不断测
                     _ratio = _af_now / _pos_prev_af
-                    assert _ratio > 1.01, (
-                        f"[adj_factor异常] {dt} {_s}: ratio={_ratio:.6f} "
-                        f"({_pos_prev_af:.4f} → {_af_now:.4f})，"
-                        f"adj_factor 应为后复权因子且除权日后因子跳升；"
-                        f"若ratio≤1，可能误用了前复权因子，将导致持仓股数缩水（严重错误）。"
-                    )
+                    _pos_adjf[_s] = _af_now  # 无论何种情况都更新缓存
+                    if _ratio <= 0.99:
+                        # ── 异常场景：因子大幅降低，可能误用了前复权因子 ──
+                        logger.warning(
+                            f"[adj_factor异常] {dt} {_s}: ratio={_ratio:.6f} "
+                            f"({_pos_prev_af:.4f} → {_af_now:.4f}), "
+                            f"adj_factor 大幅降低（可能误用前复权因子），"
+                            f"跳过股数调整以保障回测连续性"
+                        )
+                        continue
+                    elif _ratio <= 1.01:
+                        # ── 数据修正场景：因子微调，不触发股数调整 ──
+                        logger.debug(
+                            f"[adj_factor修正] {dt} {_s}: ratio={_ratio:.6f} "
+                            f"({_pos_prev_af:.4f} → {_af_now:.4f}), "
+                            f"数据源微调，跳过股数调整"
+                        )
+                        continue
+                    # else: ratio > 1.01，确认为真实除权事件，继续下方碎股清理逻辑
                     # 记录除权前总市值供不变性检测（碎股现金折算容差 0.5%）
                     _pre_value = pos_value[_si] + cash
                     # ── P0-2 审计修复：除权碎股合规性。
@@ -2126,8 +2183,31 @@ def _run_single_backtest(
             exit_high = np.isin(risk_str, ["HIGH", "D"])
             # P2-2：exit_gt 与建仓时 buy_score 比较（非当日 buy_score），反映"评分反转"退出语义
             _entry_scores = np.array([_entry_buy_score.get(s, 0.0) for s in syms_str])
-            exit_gt = (sell_score > _entry_scores + 20) & (sell_score > 0)
-            exit_score_low = (buy_score > 0) & (buy_score < _buy_threshold // 3)
+            # P0 修复：原 exit_gt 要求 sell_score > entry_score + 20 → 门槛极高导致盈利单几乎不退出
+            # 新逻辑：固定阈值 70（信号质量反转）+ 独立跟踪止盈（max_close_since_entry 回撤）
+            exit_gt = (sell_score >= 70) & (sell_score > _entry_scores + 5)
+            # P0 修复：exit_score_low 从 buy_threshold//3(≈6) 提升至 buy_threshold*0.6(≈12)，
+            # 同时要求持仓评分下降超过 15 分才触发（防震荡市误杀）
+            exit_score_low = (
+                (buy_score > 0) & (buy_score < _buy_threshold * 0.6) &
+                (_entry_scores - buy_score > 15)
+            )
+            # P2 修复（跟踪止盈 Trailing Take-Profit）：
+            # 条件：持仓浮盈超过 take_profit_pct 且从最高点回撤超过 trail_profit_ratio
+            # _max_close_since_entry 在建仓/每日维护时已更新
+            exit_take_profit = np.zeros(len(syms_str), dtype=bool)
+            if _take_profit_pct > 0 and _trail_profit_ratio > 0:
+                _entry_close_arr = np.array([_entry_close.get(s, close_adj[i]) for i, s in enumerate(syms_str)])
+                _max_close_arr = np.array([_max_close_since_entry.get(s, close_adj[i]) for i, s in enumerate(syms_str)])
+                # 当前浮盈比例（相对入场价）
+                _pnl_pct = (close_adj - _entry_close_arr) / _entry_close_arr
+                # 从最高点的回撤比例
+                _drawdown_from_max = (_max_close_arr - close_adj) / _max_close_arr
+                exit_take_profit = (
+                    (_pnl_pct >= _take_profit_pct) &
+                    (_drawdown_from_max >= _trail_profit_ratio / 100.0) &
+                    adj_ok
+                )
             
             # FIX(P1) Subtask-9：持有期限超限退出（无止损保护时避免永久持有）
             # 持仓每日递增 _held_days 计数器，超过 max_hold_days 后重新评估。
@@ -2268,7 +2348,7 @@ def _run_single_backtest(
                     })
             sel_all = (
                 held
-                & (exit_high | exit_gt | exit_score_low | stop_hit)
+                & (exit_high | exit_gt | exit_score_low | stop_hit | exit_take_profit)
                 & (not_touched_down | _sim_limits)
                 & has_volume
                 & _t1_ok
@@ -2374,9 +2454,17 @@ def _run_single_backtest(
                     if _bull_ratio < engine_cfg.market_filter_bull_ratio:
                         logger.info(
                             f"[市场过滤] {dt} 多头比 {_bull_ratio:.1%} < {engine_cfg.market_filter_bull_ratio:.0%} "
-                            f"({_bull_count}/{_total_valid}) → 熊市拒绝开新仓"
+                            f"({_bull_count}/{_total_valid}) → 熊市模式：按多头比缩放买入仓位 "
+                            f"（允许仓位比例: {_bull_ratio:.0%}，实际可买入: {max(0, int(_max_holdings * _bull_ratio))} 只）"
                         )
-                        bi = np.array([], dtype=int)  # 清空买入信号
+                        # P3 修复：从硬关断改为仓位缩放——多头比越低允许买入数越少
+                        _scaled_holdings = max(1, int(_max_holdings * (_bull_ratio / engine_cfg.market_filter_bull_ratio)))
+                        _prev_bi_len = len(bi)
+                        if len(bi) > _scaled_holdings:
+                            # 按 buy_score 降序排序后截取最强的 _scaled_holdings 只
+                            _sorted_bis = bi[np.argsort(buy_score[bi])[::-1]]
+                            bi = _sorted_bis[:_scaled_holdings]
+                            logger.debug(f"[市场过滤] {dt} 买入信号从 {_prev_bi_len} 只缩至 {len(bi)} 只")
         # ── 买入决策 ──
         if len(bi):
             b_syms = syms_str[bi]

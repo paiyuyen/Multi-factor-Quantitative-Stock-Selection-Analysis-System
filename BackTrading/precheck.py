@@ -297,6 +297,7 @@ def _check_adjust_jump(df: pd.DataFrame, p: PrecheckParams,
         # P1-9 审计修复：adj_factor 是累计因子，除权日正常向上跳变（5%~15%）。
         # 3% 阈值会误报所有正常送转/配权事件，改为只检测**回溯跳变**（因子不应该减小）。
         # 正常：f[t] >= f[t-1]；异常：f[t] < f[t-1] × 0.99 表示数据源断裂/混用。
+        # 源修正由同步层保证全量重拉(见 IncrementalSyncEngine 重叠区检测),DB 内不应残留混用段。
         ratios = np.ones(len(f))
         ratios[1:] = np.where(
             valid[1:] & valid[:-1],

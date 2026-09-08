@@ -53,7 +53,6 @@ def _regime_series(
     """全向量化的市场状态检测，返回逐 bar 的 regime 字符串数组。"""
     if params is None:
         params = {}
-    # P1.16 修复：_regime_series 中 close 必须也使用复权价，与 prepare.py / Indicators.py 对齐。
     close = df["close_normal"] if "close_normal" in df.columns else df["close"]
     ma5 = df["MA_5"]
     ma10 = df["MA_10"]
@@ -69,13 +68,7 @@ def _regime_series(
     ma_bearish = (ma5 < ma10) & (ma10 < ma20) & (ma20 < ma30) & (ma30 < ma60)
     momentum_positive = hist > 0
 
-    # DIF 斜率 — 对原始 DIF 序列做因果窗口线性回归（与 np.polyfit 数值等价）。
-    # P1 审计修复：纯 numpy correlate 替代 rolling().apply(np.polyfit)
-    # 原实现每窗口调用一次 np.polyfit（Python 级循环），3000 只 × 数百年数据 = 瓶颈
-    # P1 二次修复：此前实现误用 dif.diff()（差分序列）作为卷积 y-values，
-    # 导致计算的是"差分的斜率"而非"DIF 的斜率"，与 np.polyfit(dif) 不等价
-    # （max |diff| ≈ 0.13，符号一致率仅 63.5%）。现改为对原始 dif 做 correlate，
-    # 与 _dif_slope 内核算法一致，与 np.polyfit 最大残差 < 1e-14。
+
     n = len(df)
     dif_arr = dif.values.astype(np.float64)
     slope = np.zeros(n, dtype=float)
@@ -396,6 +389,9 @@ def _volume_price(df: pd.DataFrame, lookback: int = 5, max_score: int = 10) -> n
 
     if n <= lookback:
         return score
+
+    # FIX(P1) Subtask-7：评分精度改造 — int32 → float64
+    pct = np.zeros(n, dtype=np.float64)
 
     # 价格涨跌幅 (close[i] - close[i-lookback+1]) / close[i-lookback+1]
     pct_idx = np.arange(lookback - 1, n)

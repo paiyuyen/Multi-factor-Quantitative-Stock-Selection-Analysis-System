@@ -376,7 +376,7 @@ def precompute_all_indicators(stock_dir: str, fingerprint: str | None = None,
     在指标计算前 SKIP（precheck 日历口径硬拒）。
     """
     global _ACTIVE_FINGERPRINT
-    if fingerprint is not None and fingerprint != _ACTIVE_FINGERPRINT:
+    if fingerprint is None or fingerprint != _ACTIVE_FINGERPRINT:
         _reset_memory_caches()
         _ACTIVE_FINGERPRINT = fingerprint
 
@@ -506,10 +506,13 @@ def get_precomputed(
         若股票不足 60 根 K 线，返回 (空 DataFrame, [], [])。
     """
     # 1. 内存缓存（校验所属批次指纹，防止跨窗口切片污染）
-    if symbol in _IN_MEMORY and _SYMBOL_FPS.get(symbol) == _ACTIVE_FINGERPRINT:
-        return _IN_MEMORY[symbol], _PEAKS[symbol], _TROUGHS[symbol]
-    elif symbol in _IN_MEMORY and _ACTIVE_FINGERPRINT is None:
-        return _IN_MEMORY[symbol], _PEAKS[symbol], _TROUGHS[symbol]
+    if symbol in _IN_MEMORY:
+        # 空结果（precheck SKIP/数据不足）无过期风险，始终返回，
+        # 无需校验指纹——避免指纹不匹配时 fallback 重新计算已跳过的股票
+        if _IN_MEMORY[symbol].empty:
+            return _IN_MEMORY[symbol], _PEAKS[symbol], _TROUGHS[symbol]
+        if _SYMBOL_FPS.get(symbol) == _ACTIVE_FINGERPRINT or _ACTIVE_FINGERPRINT is None:
+            return _IN_MEMORY[symbol], _PEAKS[symbol], _TROUGHS[symbol]
 
     # 2. 磁盘缓存（校验指纹：数据范围/内容变化时缓存失效，防止 WFO 窗口切片污染）
     if stock_dir is not None:

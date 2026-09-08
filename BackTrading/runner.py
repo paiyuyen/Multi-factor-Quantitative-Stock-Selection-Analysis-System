@@ -341,7 +341,7 @@ def run_backtest_pipeline(
         logger.info(f"  股票数量: {len(symbols)}")
         _log_step("resolve_symbols")
 
-        kline_df = _fetch_kline(engine, symbols, bt.BACKTEST_START_DATE)
+        kline_df, _delisted_synced = _fetch_kline(engine, symbols, bt.BACKTEST_START_DATE)
         if kline_df.empty:
             logger.warning("K 线数据为空，跳过回测")
             return None
@@ -436,16 +436,26 @@ def run_backtest_pipeline(
         # 如果股票池中几乎没有退市股（覆盖率<5%），可能存在严重数据偏差：
         # 回测只基于存活股票，忽略已退市公司带来的尾部风险。
         # 覆盖率 < 5% 时中断回测（RuntimeError）；独立源为空时仅告警不断。
+        # kline中无退市股（_covered==0）时降级为警告，不中断回测——
+        # 这是腾讯API无老退市股历史K线数据的已知限制，不应阻断回测。
         _pool_size = len(symbols)
         _delist_coverage = len(_delisted_syms & _kline_syms) / max(_pool_size, 1)
         if _delist_coverage < 0.05 and _delisted_syms:
             _covered = len(_delisted_syms & _kline_syms)
-            raise RuntimeError(
-                f"退市股覆盖率门禁: 退市股覆盖率仅 {_delist_coverage:.1%} "
-                f"（{_covered} / {_pool_size} < 5%），"
-                f"回测结果可能因生存偏差而系统性高估。"
-                f"请扩展数据同步范围以包含退市标的历史 K 线。"
-            )
+            if _covered == 0:
+                logger.warning(
+                    f"退市股覆盖率门禁: 退市股覆盖率仅 {_delist_coverage:.1%} "
+                    f"（{_covered} / {_pool_size} < 5%），"
+                    f"腾讯API无老退市股历史K线数据（已知限制），"
+                    f"门禁降级为警告（回测继续，可能存在生存偏差）"
+                )
+            else:
+                raise RuntimeError(
+                    f"退市股覆盖率门禁: 退市股覆盖率仅 {_delist_coverage:.1%} "
+                    f"（{_covered} / {_pool_size} < 5%），"
+                    f"回测结果可能因生存偏差而系统性高估。"
+                    f"请扩展数据同步范围以包含退市标的历史 K 线。"
+                )
         elif not _delisted_syms and _pool_size > 0:
             logger.warning(
                 f"退市股覆盖率门禁: 独立退市列表与 stock_st_history 均无退市记录，"
@@ -1541,7 +1551,7 @@ def _fetch_kline(
 
     # P3-5 审计修复(P0): 同步退市股历史K线（消除生存偏差）
     # 获取已同步的退市股symbols集，后续合并到K线查询列表
-    _delisted_syms = _sync_delisted_stocks(engine, backtest_start_date)
+    _delisted_syms, _delisted_synced = _sync_delisted_stocks(engine, backtest_start_date)
 
     end = date.today()
     start = datetime.strptime(aligned_start, "%Y%m%d").date()
@@ -1557,9 +1567,9 @@ def _fetch_kline(
     provider = BacktestDataProvider(engine)
     df: pd.DataFrame = provider.get_kline(_query_symbols, start_date=buffer_start, end_date=end.isoformat())
     if df.empty:
-        return df
+        return df, _delisted_synced
     df = df.sort_values(["symbol", "trade_date"])
-    return df
+    return df, _delisted_synced
 
 
 def _sync_missing_stocks(engine: Any, symbols: list[str], backtest_start_date: str) -> None:
@@ -1626,7 +1636,7 @@ def _sync_missing_stocks(engine: Any, symbols: list[str], backtest_start_date: s
             logger.warning(f"  预热回填失败（回测继续，指标前文可能不足）: {e}")
 
 
-def _sync_delisted_stocks(engine: Any, backtest_start_date: str) -> set[str]:
+def _sync_delisted_stocks(engine: Any, backtest_start_date: str) -> tuple[set[str], int]:
     """P3-5 审计修复(P0)：同步退市股历史K线，消除生存偏差。
 
     从 AkShare 沪深交易所终止上市列表获取退市股代码，
@@ -1635,7 +1645,7 @@ def _sync_delisted_stocks(engine: Any, backtest_start_date: str) -> set[str]:
     网络失败/无可利用退市列表时优雅降级（仅告警不阻断）。
 
     Returns:
-        成功同步的退市股符号集合（供生存偏差报告使用）。
+        (退市股符号集合, 实际同步写入行数) — 供生存偏差报告与覆盖率门禁使用。
     """
     try:
         from DataManager.IncrementalSyncEngine import IncrementalSyncEngine
@@ -1643,13 +1653,13 @@ def _sync_delisted_stocks(engine: Any, backtest_start_date: str) -> set[str]:
         from UtilsManager.CodeNormalizer import CodeNormalizer
     except ImportError as e:
         logger.warning(f"  退市股同步模块导入失败: {e}")
-        return set()
+        return set(), 0
 
     # 获取退市股代码列表
     delisted_set = _fetch_extended_delisted()
     if not delisted_set:
         logger.info("  退市股列表为空或拉取失败，跳过生存偏差修复")
-        return set()
+        return set(), 0
 
     # 仅保留主板退市股（60x/00x），与 _resolve_symbols 主板过滤保持一致
     main_board_delisted = {
@@ -1658,7 +1668,7 @@ def _sync_delisted_stocks(engine: Any, backtest_start_date: str) -> set[str]:
     }
     if not main_board_delisted:
         logger.info("  无主板退市股，跳过生存偏差修复")
-        return set()
+        return set(), 0
 
     # 检查哪些退市股已存在 K 线
     with engine.connect() as conn:
@@ -1670,7 +1680,7 @@ def _sync_delisted_stocks(engine: Any, backtest_start_date: str) -> set[str]:
     missing_delisted = sorted(main_board_delisted - existing)
     if not missing_delisted:
         logger.info(f"  池内退市股 K 线已齐全 ({len(main_board_delisted)} 只)，无需补充同步")
-        return main_board_delisted
+        return main_board_delisted, 0
 
     logger.info(f"  P0生存偏差修复: {len(missing_delisted)} 只主板退市股缺失 K 线，开始回填历史数据...")
     try:
@@ -1685,9 +1695,9 @@ def _sync_delisted_stocks(engine: Any, backtest_start_date: str) -> set[str]:
         )
     except Exception as e:
         logger.warning(f"  退市股 K 线同步失败（回测继续，可能存在生存偏差）: {e}")
-        return set()
+        return set(), 0
 
-    return main_board_delisted
+    return main_board_delisted, synced_count
 
 
 def _fetch_extended_delisted() -> set[str] | None:

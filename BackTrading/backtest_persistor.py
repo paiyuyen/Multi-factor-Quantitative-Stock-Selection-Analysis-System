@@ -251,8 +251,8 @@ class BacktestPersistor:
                     })
                 if rows:
                     conn.execute(text("INSERT INTO backtest_equity VALUES "
-                                       "(:(run_id), :(trade_date), :(portfolio_value), "
-                                       ":(cash), :(position_value), :(turnover))"),
+                                       "(:run_id, :trade_date, :portfolio_value, "
+                                       ":cash, :position_value, :turnover)"),
                                  rows)
             logger.debug(f"[P2.3] 写入权益曲线 run_id={run_id} rows={len(rows)}")
         except Exception as e:
@@ -284,8 +284,8 @@ class BacktestPersistor:
                     })
                 if rows:
                     conn.execute(text("INSERT INTO backtest_trades VALUES "
-                                       "(:(run_id), :(seq), :(trade_date), :(symbol), "
-                                       ":(action), :(price), :(quantity), :(value), :(cost))"),
+                                       "(:run_id, :seq, :trade_date, :symbol, "
+                                       ":action, :price, :quantity, :value, :cost)"),
                                  rows)
             logger.debug(f"[P2.3] 写入交易流水 run_id={run_id} rows={len(rows)}")
         except Exception as e:

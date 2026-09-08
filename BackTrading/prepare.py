@@ -9,8 +9,11 @@ import shutil
 import tempfile
 import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
-from concurrent.futures.process import BrokenProcessPool
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait, ProcessPoolExecutor
+try:
+    from concurrent.futures import BrokenProcessPool
+except ImportError:
+    BrokenProcessPool = RuntimeError
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -842,24 +845,47 @@ def prepare_backtest_data(
         _pipeline_records: list[_os.OutputRecord] = []
 
         def _pipeline(syms: list[str], idx: int) -> None:
-            """单管道：ThreadPoolExecutor 并发处理股票（Windows spawn 下 ProcessPoolExecutor 会死锁）。
+            """单管道：ProcessPoolExecutor 并发处理股票（CPU 密集型，突破 GIL）。
+            P2-11 修复：原 ThreadPoolExecutor 受 GIL 限制，numpy/scipy 计算无法真正并行。
+            改用 ProcessPoolExecutor，捕获 BrokenProcessPool 异常后fallback至 ThreadPoolExecutor。
             D1 分片：失败片（=失败股票集合）在 SHARD_MAX_ATTEMPTS 内仅重跑失败片。"""
             if not syms:
                 return
             pbar = tqdm(total=len(syms), desc=f"管道{idx+1}", unit="只", ncols=50, position=idx)
-            pool = ThreadPoolExecutor(max_workers=_workers_per_pipeline)
             _p0 = time.time()
             done = 0
             failures: set[str] = set()
+
+            # ── P2-11：ProcessPoolExecutor → BrokenProcessPool 捕获 → ThreadPoolExecutor fallback ──
+            _use_process = True
             try:
+                pool = ProcessPoolExecutor(max_workers=_workers_per_pipeline)
+                logger.debug(f"  管道{idx+1} 使用 ProcessPoolExecutor（{_workers_per_pipeline} workers）")
+            except Exception as _e:
+                logger.warning(f"  管道{idx+1} ProcessPoolExecutor 创建失败 ({_e})，回退至 ThreadPoolExecutor")
+                pool = ThreadPoolExecutor(max_workers=_workers_per_pipeline)
+                _use_process = False
+
+            try:
+                # P2-11: 标记进程池是否已崩溃，避免重复告警
+                _process_pool_crashed = False
+
                 def _run_batch(syms_batch: list[str], *, progress: bool = False) -> set[str]:
                     """提交一批符号并收集失败集合（片级失败：仅这批重跑）。"""
-                    nonlocal done
+                    nonlocal done, _process_pool_crashed
                     batch_failures: set[str] = set()
                     fut_to_sym: dict[Any, str] = {}
                     for sym in syms_batch:
-                        fut = pool.submit(_worker_fn, sym, stock_dir, params, compute_exit_strategy, _susp_stats)
-                        fut_to_sym[fut] = sym
+                        try:
+                            fut = pool.submit(_worker_fn, sym, stock_dir, params, compute_exit_strategy, _susp_stats)
+                            fut_to_sym[fut] = sym
+                        except BrokenProcessPool:
+                            # ── P2-11：进程池崩溃，标记后将所有未完成的股票加入失败集合 ──
+                            if not _process_pool_crashed:
+                                _process_pool_crashed = True
+                                logger.error(f"  管道{idx+1} ProcessPoolExecutor 进程崩溃，剩余 {len(syms_batch)} 只全部标记失败")
+                            batch_failures.update(syms_batch)
+                            break
 
                     for future in as_completed(fut_to_sym):
                         sym = fut_to_sym[future]
@@ -873,6 +899,12 @@ def prepare_backtest_data(
                                     rows=len(rows),
                                     written_at=time.time(),
                                 ))
+                        except BrokenProcessPool:
+                            # ── P2-11：取结果时进程崩溃 ──
+                            if not _process_pool_crashed:
+                                _process_pool_crashed = True
+                                logger.error(f"  管道{idx+1} 取结果时进程崩溃，[{sym}] 等未完成股票标记失败")
+                            batch_failures.add(sym)
                         except Exception as e:
                             batch_failures.add(sym)
                             logger.opt(exception=True).warning(f"  [{sym}] 信号计算失败: {e}")

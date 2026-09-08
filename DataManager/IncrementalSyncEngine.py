@@ -58,7 +58,8 @@ class IncrementalSyncEngine:
             _bj_now = datetime.now().astimezone().astimezone(timezone(timedelta(hours=8)))
             self._trade_date = self._expected_kline_date(_cal, _bj_now) or date.today()
         except Exception:
-            self._trade_date = date.today()
+            # 兜底仍严格使用北京时间,避免非北京时区机器基准日错一天
+            self._trade_date = datetime.now().astimezone().astimezone(timezone(timedelta(hours=8))).date()
         self._trade_date_str = self._trade_date.isoformat().replace("-", "")
         # 全局共享 Session，提升连接池匹配两管道各 2 worker（共 4 路并发）
         self._session = requests.Session()
@@ -186,7 +187,7 @@ class IncrementalSyncEngine:
                 datetime.strptime(self._default_start, "%Y%m%d").strftime("%Y-%m-%d")
                 if self._default_start else "2000-01-01"
             )
-        return (min_latest - timedelta(days=OVERLAP_DAYS)).isoformat()
+        return (min_latest - timedelta(days=OVERLAP_DAYS + 1)).isoformat()
 
     # ── Dual Pipeline ───────────────────────────────────────────
 
@@ -211,8 +212,35 @@ class IncrementalSyncEngine:
         logger.info(f"管道{label} 完成,写入 {inserted} 行(失败 {len(all_failures)} 只)")
         return inserted, all_failures
 
-    def _batch_get_latest_date(self, symbols: list[str]) -> dict[str, date | None]:
-        """批量获取每只股票的最新日期, 一次 DB 查询."""
+    def _batch_get_overlap_history(self, symbols: list[str], start: str) -> dict[str, dict[str, tuple[float | None, float | None]]]:
+        """批量获取每只股票重叠区 [start, ∞) 的 DB 历史,一次查询。
+
+        返回 {symbol: {trade_date_iso: (close_normal, adj_factor)}}，
+        供增量判定对同一天做新旧对比（旧值=DB 已存值，新值=本次拉取值）。
+        """
+        if not symbols:
+            return {}
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(f"""
+                    SELECT symbol, trade_date::date AS d, close_normal, adj_factor
+                    FROM {TABLE}
+                    WHERE symbol = ANY(:symbols) AND trade_date::date >= :start
+                """),
+                {"symbols": symbols, "start": datetime.strptime(start, "%Y%m%d").date()},
+            ).fetchall()
+        out: dict[str, dict[str, tuple[float | None, float | None]]] = {}
+        for sym, d, cn, adj in rows:
+            out.setdefault(sym, {})[d.isoformat()] = (
+                float(cn) if cn is not None else None,
+                float(adj) if adj is not None else None,
+            )
+        return out
+
+    def _batch_get_last_date(self, symbols: list[str]) -> dict[str, date | None]:
+        """批量获取每股 DB 内最新交易日(全区间),一次查询,用于停牌/缺口预分类."""
+        if not symbols:
+            return {}
         with self._engine.connect() as conn:
             rows = conn.execute(
                 text(f"""
@@ -225,32 +253,14 @@ class IncrementalSyncEngine:
             ).fetchall()
         return {row[0]: row[1] for row in rows}
 
-    def _batch_get_latest_adj(self, symbols: list[str]) -> dict[str, float | None]:
-        """批量获取每只股票的最新 adj_factor,一次 DB 查询."""
-        with self._engine.connect() as conn:
-            rows = conn.execute(
-                text(f"""
-                    SELECT DISTINCT ON (symbol) symbol, adj_factor
-                    FROM {TABLE}
-                    WHERE symbol = ANY(:symbols) AND adj_factor IS NOT NULL
-                    ORDER BY symbol, trade_date DESC
-                """),
-                {"symbols": symbols},
-            ).fetchall()
-        return {row[0]: row[1] for row in rows}
-
-    def _batch_has_close_normal(self, symbols: list[str]) -> set[str]:
-        """批量查询哪些股票已有 close_normal,一次 DB 查询."""
-        with self._engine.connect() as conn:
-            rows = conn.execute(
-                text(f"""
-                    SELECT DISTINCT symbol
-                    FROM {TABLE}
-                    WHERE symbol = ANY(:symbols) AND close_normal IS NOT NULL
-                """),
-                {"symbols": symbols},
-            ).fetchall()
-        return {row[0] for row in rows}
+    @staticmethod
+    def _safe_num(v: Any, default: float | None = None) -> float | None:
+        """尽可能将腾讯返回字段转为有限浮点数;格式异常返回 default."""
+        try:
+            f = float(v)
+            return f if math.isfinite(f) else default
+        except (TypeError, ValueError):
+            return default
 
     TX_URL = "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get"
 
@@ -463,8 +473,14 @@ class IncrementalSyncEngine:
             out["close_normal"].append(close_raw * factor)
             out["high_normal"].append(float(raw[3]) * factor)
             out["low_normal"].append(float(raw[4]) * factor)
-            out["volume"].append(int(float(raw[5]) * 100))
-            out["amount"].append(float(raw[8]) * 10000)
+            vol = self._safe_num(raw[5] if len(raw) > 5 else None)
+            if vol is None or vol < 0:
+                skipped += 1
+                logger.warning(f"asharehub 因子重建 {symbol} 丢弃交易日 {d}: 成交量异常(vol={raw[5] if len(raw) > 5 else None})")
+                continue
+            out["volume"].append(int(vol * 100))
+            amt = self._safe_num(raw[8] if len(raw) > 8 else None)
+            out["amount"].append((amt * 10000) if amt is not None else 0.0)
             out["adj_factor"].append(factor)
         if skipped:
             logger.warning(f"asharehub 因子重建 {symbol} 跳过 {skipped}/{len(filtered)} 天(因子缺失)")
@@ -539,12 +555,54 @@ class IncrementalSyncEngine:
                 out["close_normal"].append(close_raw * adj_factor)
                 out["high_normal"].append(float(raw[3]) * adj_factor)
                 out["low_normal"].append(float(raw[4]) * adj_factor)
-            out["volume"].append(int(float(raw[5]) * 100))
-            out["amount"].append(float(raw[8]) * 10000)
+            vol = self._safe_num(raw[5] if len(raw) > 5 else None)
+            if vol is None or vol < 0:
+                # 成交量缺失/异常:无法重建,丢弃该日
+                skipped += 1
+                logger.warning(f"腾讯API {symbol} 丢弃交易日 {d}: 成交量异常(vol={raw[5] if len(raw) > 5 else None})")
+                continue
+            out["volume"].append(int(vol * 100))
+            amt = self._safe_num(raw[8] if len(raw) > 8 else None)
+            out["amount"].append((amt * 10000) if amt is not None else 0.0)
             out["adj_factor"].append(adj_factor)
         if skipped:
             logger.warning(f"腾讯API {symbol} 丢弃 {skipped}/{len(filtered)} 个非法价格交易日(close<=0 或 NaN)")
         return pd.DataFrame(out)
+
+    def _detect_overlap_correction(self, db_rows: dict[str, tuple[float | None, float | None]],
+                                   grp: pd.DataFrame) -> tuple[bool, str, str]:
+        """重叠区同日期新旧对比，判断是否触发全量重拉（P0-13）。
+
+        逐日对齐 DB 与本次拉取的同一天值，统一 0.1% 容差判定：
+          - adj_factor 同日期 ratio ∉ [0.999, 1.001] → 除权/因子修正
+          - close_normal 同日期相对偏差 > 0.001      → 数据源修正历史
+        加滞回：需 ≥2 个不同交易日均不一致才判定重拉，过滤数据源瞬时抖动/单日修正。
+        返回 (是否重拉, 原因, DB 最新交易日 ISO)。
+        """
+        latest_iso = max(db_rows)
+        grp_by_date = grp.set_index("trade_date")
+        _TOL = 0.001  # 0.1% 统一容差
+        adj_bad: set[str] = set()
+        cn_bad: set[str] = set()
+        for d, (db_cn, db_adj) in db_rows.items():
+            if d not in grp_by_date.index:
+                continue
+            row = grp_by_date.loc[d]
+            new_adj = row.get("adj_factor")
+            if new_adj is not None and db_adj is not None and db_adj != 0:
+                ratio = new_adj / db_adj
+                if ratio > 1.0 + _TOL or ratio < 1.0 - _TOL:
+                    adj_bad.add(d)
+            new_cn = row.get("close_normal")
+            if new_cn is not None and db_cn is not None and db_cn != 0:
+                dev = abs(new_cn / db_cn - 1.0)
+                if dev > _TOL:
+                    cn_bad.add(d)
+        bad_dates = adj_bad | cn_bad
+        if len(bad_dates) >= 2:
+            return True, (f"重叠区 {len(bad_dates)} 天不一致"
+                          f"(adj_factor {len(adj_bad)} 天, close_normal {len(cn_bad)} 天)"), latest_iso
+        return False, "overlap stable", latest_iso
 
     def _process_batch(self, symbols: list[str], start: str, end: str, desc: str = "", force: bool = False) -> tuple[int, list[str]]:
         """并发取窗口数据 → 批量 DB 查询 → 内存判断 → 一次写入.
@@ -553,14 +611,33 @@ class IncrementalSyncEngine:
         （幂等 upsert,用于指标预热历史回填;否则已有数据只写增量,
         早期历史会被丢弃导致回填永不生效）。
         """
-        # Step 1: concurrent fetch
+        # Step 1: 预分类 + 并发取窗口数据
+        # 1a. 预查每股 DB 最新交易日,识别窗口内无成交的疑似停牌/长空窗股：
+        #     统一窗口对它们没有可拉数据,不该进并发拉取池(浪费请求/污染失败缓存);
+        #     改为按缺口区间 [last+1, end] 单独补拉,复牌或漏采恢复时自动补全。
+        if force:
+            fetch_syms: list[str] = list(symbols)
+            fill_candidates: dict[str, tuple[date, date]] = {}
+        else:
+            start_date = datetime.strptime(start, "%Y%m%d").date()
+            end_date = datetime.strptime(end, "%Y%m%d").date()
+            last_map = self._batch_get_last_date(symbols)
+            fill_candidates = {}
+            fetch_syms = []
+            for sym in symbols:
+                ld = last_map.get(sym)
+                if ld is not None and ld < start_date and (end_date - ld).days > OVERLAP_DAYS:
+                    fill_candidates[sym] = (ld + timedelta(days=1), end_date)
+                else:
+                    fetch_syms.append(sym)
+
         all_data: dict[str, pd.DataFrame] = {}
         failed: list[str] = []
         # position 区分管道: A=0, B=1, 防止 tqdm 互相覆盖
         _pos = 0 if 'A' in desc else (1 if 'B' in desc else None)
-        with tqdm(total=len(symbols), desc=desc, unit="stk", leave=False, position=_pos) as pbar:
+        with tqdm(total=len(fetch_syms), desc=desc, unit="stk", leave=False, position=_pos) as pbar:
             with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
-                futures = {ex.submit(self._fetch_one_stock, sym, start, end): sym for sym in symbols}
+                futures = {ex.submit(self._fetch_one_stock, sym, start, end): sym for sym in fetch_syms}
                 for future in as_completed(futures):
                     sym = futures[future]
                     try:
@@ -574,17 +651,47 @@ class IncrementalSyncEngine:
                         failed.append(sym)
                     pbar.update(1)
 
+        # 1b. 疑似停牌/长空窗股缺口补拉 [last+1, end];成功即与 DB 无重叠,可直接写
+        if fill_candidates:
+            with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
+                futures = {
+                    ex.submit(self._fetch_one_stock, sym, s.strftime("%Y%m%d"), e.strftime("%Y%m%d")): sym
+                    for sym, (s, e) in fill_candidates.items()
+                }
+                for future in as_completed(futures):
+                    sym = futures[future]
+                    try:
+                        df = future.result()
+                        if df is not None and not df.empty:
+                            all_data[sym] = df
+                            logger.info(f"  [{sym}] 缺口补拉 {fill_candidates[sym][0]} ~ {end} 成功,恢复 {len(df)} 行")
+                        else:
+                            logger.info(f"  [{sym}] 窗口内无成交(最近交易 {last_map.get(sym)}),判定停牌跳过")
+                    except Exception as e:
+                        logger.error(f"  [{sym}] 缺口补拉异常: {type(e).__name__}: {e}")
+
+        if not force:
+            # 1c. 区分真失败与"窗口内无成交"(停牌)：
+            #     窗口内应有数据却拉取失败,或 DB 无历史且拉不到 → 真失败,留待下次重试;
+            #     最近交易日早在窗口 start 之前 → 停牌,不标记失败,避免失败缓存被停牌股污染。
+            final_failed: list[str] = []
+            for sym in failed:
+                ld = last_map.get(sym)
+                if ld is None or ld >= start_date:
+                    final_failed.append(sym)
+                else:
+                    logger.info(f"  [{sym}] 窗口内无成交(最近交易 {ld}),跳过(不标记失败)")
+            failed = final_failed
+
         if not all_data:
             logger.info(f"  {desc} 完成: 成功 0 只, 失败 {len(failed)} 只")
             return 0, failed
 
         # Step 2: bulk DB reads (force 模式全量覆盖,无需读取已有状态)
         syms = list(all_data.keys())
-        latest_map = self._batch_get_latest_date(syms) if not force else {}
-        adj_map = self._batch_get_latest_adj(syms) if not force else {}
-        has_cn_set = self._batch_has_close_normal(syms) if not force else set()
+        db_map = self._batch_get_overlap_history(syms, start) if not force else {}
 
-        # Step 3: identify split stocks
+        # Step 3: identify split stocks（P0-13 同日期新旧对比判定）
         to_write: list[pd.DataFrame] = []
         written_symbols: set[str] = set()
         split_syms: list[str] = []
@@ -596,45 +703,20 @@ class IncrementalSyncEngine:
                 to_write.append(grp)
                 written_symbols.add(sym)
                 continue
-            latest = latest_map.get(sym)
-            has_cn = sym in has_cn_set
-
-            if latest is None or not has_cn:
+            db_rows = db_map.get(sym)
+            if not db_rows or not any(cn is not None for cn, _ in db_rows.values()):
+                # 首次拉取或 DB 缺少 close_normal:全量写入
                 to_write.append(grp)
                 written_symbols.add(sym)
                 continue
 
-            old_adj = adj_map.get(sym)
-            if old_adj is not None:
-                match = grp.loc[grp["trade_date"] == latest.isoformat(), "adj_factor"]
-                if not match.empty:
-                    new_adj = match.iloc[0]
-                    ratio = new_adj / old_adj
-                    # P1-1 修复：任何 adj_factor 变化（含腾讯因子修正/小除权）都触发全量重拉
-                    # 原逻辑 1% 阈值导致小除权/因子修正静默跳过→close_normal 边界断裂→假金叉/假止损
-                    if ratio > 1.0001 or ratio < 0.9999:
-                        logger.debug(
-                            f"  [{sym}] adj_factor 变化 {ratio:.6f} (old={old_adj:.6f}, new={new_adj:.6f}), 触发全量重拉"
-                        )
-                        split_syms.append(sym)
-                        continue
+            should_repull, reason, latest_iso = self._detect_overlap_correction(db_rows, grp)
+            if should_repull:
+                logger.warning(f"  [{sym}] {reason}, 触发全量重拉")
+                split_syms.append(sym)
+                continue
 
-                    # P1-1 边界连续性校验：adj_factor 未变但 close_normal 在重叠区有跳变→数据源修正，触发全量重拉
-                    if "close_normal" in grp.columns:
-                        overlap = grp[grp["trade_date"] <= latest.isoformat()]
-                        if len(overlap) >= 2:
-                            overlap_sorted = overlap.sort_values("trade_date")
-                            cn_series = overlap_sorted["close_normal"]
-                            cn_changes = cn_series.pct_change().abs()
-                            # 重叠区内出现 >0.5% 的跳变（不含停牌）视为数据源修正
-                            if (cn_changes > 0.005).any():
-                                logger.warning(
-                                    f"  [{sym}] close_normal 重叠区不连续 (max pct_change={cn_changes.max():.6f}), 触发全量重拉"
-                                )
-                                split_syms.append(sym)
-                                continue
-
-            new = grp[grp["trade_date"] > latest.isoformat()]
+            new = grp[grp["trade_date"] > latest_iso]
             if not new.empty:
                 to_write.append(new)
                 written_symbols.add(sym)
@@ -643,7 +725,7 @@ class IncrementalSyncEngine:
         if split_syms:
             full_start = self._default_start.replace("-", "") if self._default_start else "20190101"
             full_end = self._trade_date.strftime("%Y%m%d")
-            logger.info(f"  {len(split_syms)} 只除权除息,并发拉取全量历史")
+            logger.info(f"  {len(split_syms)} 只触发重拉(除权/数据源修正),并发拉取全量历史")
             with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
                 futures = {ex.submit(self._fetch_one_stock, sym, full_start, full_end): sym for sym in split_syms}
                 for future in as_completed(futures):
