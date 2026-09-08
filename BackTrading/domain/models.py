@@ -94,14 +94,12 @@ DEFAULT_TRANSFER_FEE_SEGMENTS: tuple[tuple[str, float], ...] = (
     ("2012-09-01", 0.00006),
     ("2000-01-01", 0.00006),
 )
-# P2-3（审计）：沪市过户费计费方式改革日——2015-08-01（含）起按成交金额
 # 0.02‰ 双边收取；2012-09-01 至 2015-07-31 按成交金额 0.06‰ 双边收取
 # （成交面值 0.3‰ 口径）；此前按成交股数收取（每 1000 股 1 元，双向，仅沪 A）。
 TRANSFER_FEE_AMOUNT_BASED_DATE: str = "2015-08-01"
 TRANSFER_FEE_AMOUNT_006_DATE: str = "2012-09-01"
 # P2-3（审计）：2012-09-01 前沪 A 按股数计费的单价（1 元/千股 = 0.001 元/股）。
 TRANSFER_FEE_PER_SHARE_RATE: float = 0.001
-# P0-12 审计修复：过户费征收范围统一日期。
 # 2022-04-29 起沪深两市 A 股均按 0.01‰ 双边征收过户费（此前深市 A 股不征收，
 # 仅沪市 A 股征收）。transfer_fee_segments 分段表日期与之对齐（首段即 2022-04-29）。
 TRANSFER_FEE_UNIFIED_DATE: str = "2022-04-29"
@@ -110,7 +108,6 @@ TRANSFER_FEE_UNIFIED_DATE: str = "2022-04-29"
 DEFAULT_HANDLING_FEE_RATE: float = 0.0000341
 DEFAULT_CSRC_FEE_RATE: float = 0.00002
 # 经手费日期分段表（双边，date:rate 升序，取最晚 ≤ 交易日的档）。
-# P1.7 审计修复：校正经手费历史分段——
 #   2020-09-28 起：0.00341%（经手费大幅下调，2020年9月28日）
 #   2015-08-01 起：0.00487%（经手费下调）
 #   2012-09-01 起：0.00696%（沪深统一按成交金额双向收取）
@@ -124,7 +121,6 @@ DEFAULT_HANDLING_FEE_SEGMENTS: tuple[tuple[str, float], ...] = (
     ("2000-01-01", 0.000025),
 )
 # 证管费日期分段表（双边，date:rate 升序，取最晚 ≤ 交易日的档）。
-# P1.8 审计修复：补全证管费历史分段节点——
 #   2020-08-01 起：0%（证监会暂停征收证管费）
 #   2015-08-01 起：0.002%（减半征收，从0.004%降至0.002%）
 #   2008-09-19 起：0.0024%（印花税减半时同步调整，从0.0048%降至0.0024%）
@@ -209,7 +205,6 @@ class CostModel:
         self.csrc_fee_segments = tuple(
             sorted(self.csrc_fee_segments, key=lambda x: str(x[0]))
         )
-        # P0-10 审计修复：与印花税一致，经手费/证管费单值回退必须与分段表兜底段一致，
         # 否则 commission_includes_fees=False 时历史成本被低估 ~30%（0.00487%→0.00341%）
         for _name, _rate, _segs in (
             ("handling_fee_rate", self.handling_fee_rate, self.handling_fee_segments),
@@ -225,7 +220,7 @@ class CostModel:
                         f"回退路径（无命中时）将使用 {_rate}，"
                         f"可能导致历史经手费/证管费被低估。建议将 {_name} 设置为 {_fallback_rate}。"
                     )
-        # P1 审计修复：stamp_tax_rate 回退值必须与分段表兜底段（最早日期档）一致
+
         # 否则 2023-08-28 前交易按错误税率收取，历史成本被低估
         if self.stamp_tax_segments:
             _fallback_date, _fallback_rate = self.stamp_tax_segments[0]  # 最早日期 = 兜底
@@ -529,13 +524,9 @@ class CostModel:
         )
         commission_rate = self._commission_rate_for(value)
         commission = max(value * commission_rate, self.min_commission_per_trade)
-        # P2-3（审计）：过户费按市场×日期×计费方式收取（按股数/按金额/沪深范围）
         transfer = self._transfer_fee_for(symbol or "", value, volume, dt)
-        # #1 修复：佣金为全包价时，经手费/证管费不单独收取
-        # P0-10：经手费/证管费按日期分段表取历史费率（2023-08-28 / 2015-08-01 分界）
         handling = 0.0 if self.commission_includes_fees else value * self.handling_fee_rate_for(dt)
         csrc = 0.0 if self.commission_includes_fees else value * self.csrc_fee_rate_for(dt)
-        # P2-3（审计）：2008-09-19 前印花税双边征收（买卖双方均按当期税率缴纳）；
         # 改革后买入不征收印花税
         stamp = 0.0
         if dt is not None and str(dt) < STAMP_TAX_UNILATERAL_DATE:
@@ -568,31 +559,11 @@ class CostModel:
         """卖出成本拆解 = 买入成本项 + 印花税（按日期表）。
 
         stamp_tax_rate 显式传入优先；否则按 dt 查 stamp_tax_segments 日期表。
-        P2-3（审计）：2008-09-19 起印花税仅卖出征收（本函数 stamp = 卖出侧）；
         此前双边征收——买入侧已在 buy_cost_breakdown 中补收，此处覆盖的 stamp
         为卖出侧份额，买卖两侧合计 = 双边全额。
         过户费按市场×日期×计费方式收取（P2-3：按金额/按股数/沪深范围分段）。
         """
-        """卖出成本拆解 — 内部结构说明：
 
-        本函数返回的 `parts` 基于 `buy_cost_breakdown` 的结果再追加卖出侧印花税。
-        因此 `total` = 买入成本项总和 + 卖出印花税（stamp_sell）。
-
-        【2008-09-19 前双边印花税语义】
-        - 2008-09-19 前：buy_cost_breakdown 已收取 stamp_buy = value × rate_for(dt)；
-          本函数再追加 stamp_sell = value × rate_for_dt，`total` 中包含 stamp_buy + stamp_sell。
-          parts["stamp"] 字段仅记录卖出侧 stamp（展示用），total 不受影响（已含 stamp_buy）。
-        - 2008-09-19 后：buy_cost_breakdown 不收取 stamp；parts["stamp"] = stamp_sell。
-
-        【过户费语义】
-        _transfer_fee_for 在 buy_cost_breakdown 中执行（沪 A 按日期分段/按股数），
-        本函数的 total 已含过户费——即卖出这一笔交易的过户费由 buy_cost_breakdown
-        内部路径覆盖。这是设计意图（买卖过户费同规则），NOT a bug。
-
-        ⚠️ 修改此函数时务必保持：sell_cost 返回的是"卖出交易的完整成本"（含自身过户费），
-        而非"卖出印花税 alone"。当前引擎中 buy_cost() 与 sell_cost() 分别独立调用，
-        不存在费用叠加问题。
-        """
         parts = self.buy_cost_breakdown(
             value, volume, adv, order_type=order_type, amount_ma20=amount_ma20,
             dt=dt,
@@ -652,11 +623,7 @@ class CostModel:
     def _parse_stamp_segments(cls, s: str) -> tuple[tuple[str, float], ...]:
         """解析 "date:rate;date:rate" 印花税日期表，按日期升序。
 
-        #2 审计修复：强制注入兜底段（date <= 2005-01-01），确保自定义配置
-        不丢失早期历史数据的税率。若用户未提供兜底段，从 DEFAULT_STAMP_TAX_SEGMENTS
-        取最早段注入（[-1]——源序为最新在前，[-1] 即 2000-01-01 兜底段；
-        [0] 为最新段，注入会令早于自定义起始日的历史日期按 2023-08-28 后费率
-        被低估，P2 审计修复统一为 [-1] 口径）。
+
         """
         segs: list[tuple[str, float]] = []
         for part in str(s).split(";"):
@@ -679,9 +646,6 @@ class CostModel:
     @classmethod
     def _parse_transfer_segments(cls, s: str) -> tuple[tuple[str, float], ...]:
         """解析 "date:rate;date:rate" 过户费日期表，按日期升序。
-
-        #2 审计修复：同上，强制注入兜底段（[-1] 最老段，P2 审计修复与
-        经手费/证管费 parse 口径统一）。
         """
         segs: list[tuple[str, float]] = []
         for part in str(s).split(";"):

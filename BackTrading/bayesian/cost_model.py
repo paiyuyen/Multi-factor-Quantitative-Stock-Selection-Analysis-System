@@ -137,6 +137,11 @@ class FidelityController:
         self._data_key = _data_fingerprint(kline_df) if not self._has_signals else ""
         if data_version:
             self._data_key = f"{self._data_key or 'pre'}:{data_version}"
+        # P4-Fix: 将 eval_start_date 纳入缓存 key，隔离不同 WFO 窗口的信号缓存。
+        # 即使 K 线数据相同，不同窗口的 expanding 统计量起点不同（已改为 rolling(252)），
+        # 仍应在缓存层面显式隔离，防微杜渐。
+        if eval_start_date:
+            self._data_key = f"{self._data_key}_eval_start={eval_start_date}"
 
     def _config_hash(self) -> str:
         """计算当前 BaseConfig 的哈希，用于全局缓存键。"""

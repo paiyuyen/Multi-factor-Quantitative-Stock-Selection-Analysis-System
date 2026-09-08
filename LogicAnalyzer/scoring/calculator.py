@@ -423,7 +423,6 @@ class FactorCalculator:
         result["龙虎榜评分"] = trader_score.reindex(result.index).fillna(0)
 
         # 宏观因子（行业 tilt，不是截面 Z-Score）
-        # P0-7 ①：tilt 按申万一级 key 映射 —— 报告含 行业一级（stock_basic_info_sw_l1）
         # 时优先使用，否则回退二级 行业（可能多数为 0，调用方已记录降级日志）
         _macro_ind_col = "行业一级" if "行业一级" in result.columns else industry_col
         macro_score = self.calc_macro_scores(result, macro_tilts, _macro_ind_col)

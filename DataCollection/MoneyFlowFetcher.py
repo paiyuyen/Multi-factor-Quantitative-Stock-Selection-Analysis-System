@@ -61,7 +61,6 @@ class MoneyFlowFetcher:
     @property
     def client(self) -> Any:  # noqa: ANN401
         if self._client is None and self.api_key:
-            # P2-2（审计）：工厂注入（原全局 monkeypatch + verify=False 已移除）
             from UtilsManager.AShareHubClient import make_asharehub_client
             self._client = make_asharehub_client(api_key=self.api_key)
         return self._client

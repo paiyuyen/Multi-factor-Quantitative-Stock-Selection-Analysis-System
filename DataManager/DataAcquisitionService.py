@@ -311,7 +311,6 @@ class DataAcquisitionService:
             logger.error(f"  - [FAIL] 获取主力成本数据失败: {e}")
             data["main_cost_data"] = pd.DataFrame()
 
-        # P2.2：外部数据源交叉校验 — akshare vs asharehub OHLCV 偏差检测
         try:
             # 从已获取数据中提取候选股票代码清单
             candidate_syms = set()

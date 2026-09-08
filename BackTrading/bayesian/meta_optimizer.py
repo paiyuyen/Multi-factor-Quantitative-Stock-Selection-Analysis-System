@@ -472,6 +472,38 @@ def bayesian_walk_forward_multi(
                            f"{_to_date_str(train_dates[0])}~{_to_date_str(train_dates[-1])}")
             logger.info(f"  [{path_idx + 1}-{win_idx}] 训练数据: {len(train_data)}行, {train_data['symbol'].nunique()}只股票")
 
+            # ── 窗口质量预检：默认参数轻量回测（P4-Fix） ──
+            # 在 BO 前先用参数空间中点值快速跑一次回测。默认参数都没超额收益的窗口，
+            # 后续 BO 也基本不可能找到好参数——直接跳过，节省 2~3 小时算力。
+            _skip_threshold = -0.5
+            _precheck_sharpe = None
+            try:
+                from BackTrading.bayesian.cost_model import FidelityController as _FC
+                from BackTrading.bayesian.space import _get_fixed_params as _space_fixed
+                _mid_params = {n: (sp.low + sp.high) / 2 for n, sp in spaces.items()}
+                _all_params = {**_space_fixed(), **_mid_params}
+                _pre_ctrl = _FC(train_data, base_cfg, compute_exit_strategy=True,
+                                vectorized=True, eval_start_date=train_eval_start,
+                                st_history=st_history, exclude_st=exclude_st,
+                                data_version=data_version, listing_days=listing_days,
+                                db_engine=db_engine)
+                _pre_res = _pre_ctrl.evaluate(_all_params, fidelity=1)
+                _precheck_sharpe = _pre_res.get("sharpe", float("-inf"))
+                if _precheck_sharpe < _skip_threshold:
+                    logger.warning(
+                        f"  [{path_idx + 1}-{win_idx}] 窗口质量预检未通过: "
+                        f"默认参数 IS Sharpe={_precheck_sharpe:.4f} < {_skip_threshold}，"
+                        f"跳过该窗口的全部 BO 寻优"
+                    )
+                    continue
+            except Exception as _pre_e:
+                logger.debug(f"  [{path_idx + 1}-{win_idx}] 窗口预检异常({_pre_e})，继续正常优化")
+            if show_progress and _precheck_sharpe is not None:
+                logger.info(
+                    f"  [{path_idx + 1}-{win_idx}] 窗口预检通过: "
+                    f"默认参数 IS Sharpe={_precheck_sharpe:.4f}，开始 BO 寻优"
+                )
+
             # ── 贝叶斯优化 IS ──
             try:
                 best_params, gp_state, top_k_params, is_sharpe, is_equity = optimize_window(
@@ -554,59 +586,21 @@ def bayesian_walk_forward_multi(
             oos = oos_results[0] if oos_results else {}
             oos_sharpe = oos.get("oos_sharpe", 0) or 0
 
-            # ── DM 检验（P2.2）：rank-1 参数 vs 基准中位数参数，OOS 显著性 ──
-            # 若寻优参数相对基准无显著优势（p ≥ 0.05），说明"最优"只是噪声尖峰，
-            # 该窗口不参与最终稳健中位数主路径（由 runner._extract_best_params 过滤）。
-            _dm_stat: float | None = None
-            _dm_p_value: float | None = None
-            _dm_pass: bool = True
-            try:
-                from BackTrading.overfitting import compute_dm_test as _dm_test
-
-                _mid_params = {n: (sp.low + sp.high) / 2 for n, sp in spaces.items()}
-                _base_results = _oos_validate(
-                    test_data, [_mid_params], base_cfg, top_m=1,
-                    eval_start_date=test_eval_start,
-                    st_history=st_history, exclude_st=exclude_st,
-                    data_version=data_version,
-                    listing_days=listing_days,
-                    db_engine=db_engine,
-                )
-                _rank1_ec = oos_results[0].get("oos_equity", []) if oos_results else []
-                _base_ec = _base_results[0].get("oos_equity", []) if _base_results else []
-                if len(_rank1_ec) >= 10 and len(_base_ec) >= 10:
-                    _ra = np.diff(np.array([e.get("portfolio_value", 0) for e in _rank1_ec], dtype=float)) / \
-                          np.maximum(np.array([e.get("portfolio_value", 0) for e in _rank1_ec[:-1]], dtype=float), 1e-9)
-                    _rb = np.diff(np.array([e.get("portfolio_value", 0) for e in _base_ec], dtype=float)) / \
-                          np.maximum(np.array([e.get("portfolio_value", 0) for e in _base_ec[:-1]], dtype=float), 1e-9)
-                    _dm_stat, _dm_p_value = _dm_test(_ra, _rb)
-                    _dm_pass = bool(_dm_p_value < 0.05 and _dm_stat > 0)
-                    if not _dm_pass:
-                        logger.warning(
-                            f"  [{path_idx + 1}-{win_idx}] DM检验: rank-1 相对基准中位数无显著优势"
-                            f"（stat={_dm_stat:.2f}, p={_dm_p_value:.3f}），窗口不参与稳健中位数主路径"
-                        )
-            except Exception as _dme:
-                logger.warning(f"  [{path_idx + 1}-{win_idx}] DM 检验异常: {_dme}，跳过")
-
-            # ── 时间预算（P2.4）：窗口粒度检查，超时提前终止 ──
-            if time_budget_seconds > 0 and (time.monotonic() - _t_wfo_start) > time_budget_seconds:
-                logger.critical(
-                    f"时间预算 {time_budget_seconds/3600:.1f}h 已耗尽，"
-                    f"提前终止 WFO（已收集 {len(all_path_results)} 组窗口结果）"
-                )
-                _time_up = True
-
             # ── OOS 衰减 gate（业务规则：IS→OOS 风险调整收益衰减 > 30% 即废弃） ──
             # IS 净值曲线 = 优化器最优候选在训练集上的回测曲线（严格不含 OOS）；
             # OOS 净值曲线 = rank-1 参数在独立测试集上的回测曲线。
+            # 注意：OOS 衰减 gate 放在 DM 检验之前——IS_Sharpe ≤ 0 时直接废弃，
+            # 无需再消耗 ~30 分钟做 DM 检验。
             _decay_pass = True
             _decay_report = None
             if is_equity is not None and oos_results:
                 _oos_curve = oos_results[0].get("oos_equity")
                 if _oos_curve:
                     try:
-                        from BackTrading.overfitting import validate_oos_decay as _vd_oos
+                        from BackTrading.overfitting import (
+                            validate_oos_decay as _vd_oos,
+                            OverfitType as _OverfitType,
+                        )
                         _decay_report = _vd_oos(
                             is_equity, _oos_curve,
                             is_days=len(train_dates), oos_days=len(test_dates),
@@ -614,6 +608,7 @@ def bayesian_walk_forward_multi(
                         _decay_pass = _decay_report.passed
                     except Exception as _de:
                         logger.warning(f"  [{path_idx + 1}-{win_idx}] OOS 衰减校验异常: {_de}，窗口照常保留")
+
             if not _decay_pass:
                 _oos_trades = oos.get("total_trades", 0) or 0
                 if _oos_trades == 0:
@@ -621,13 +616,40 @@ def bayesian_walk_forward_multi(
                         f"  [{path_idx + 1}-{win_idx}] OOS 区间 {len(test_dates)} 天无任何交易，"
                         f"信号未触发（非过拟合），窗口结果无效"
                     )
-                logger.warning("=" * 64)
-                logger.warning(
-                    f"  [{path_idx + 1}-{win_idx}] OOS 衰减校验未通过"
-                    f"（IS_Sharpe={float(is_sharpe):.2f} → OOS_Sharpe={oos_sharpe:.2f}），"
-                    f"疑似超参数过度网格搜索或特征工程隐性泄露，该窗口结果直接废弃"
-                )
-                logger.warning("=" * 64)
+
+                # 根据 overfit_type 生成区分日志
+                if _decay_report is not None:
+                    _otype = _decay_report.overfit_type
+                    if _otype == _OverfitType.INVALID:
+                        logger.warning("=" * 64)
+                        logger.warning(
+                            f"  [{path_idx + 1}-{win_idx}] 策略无效 | "
+                            f"IS_Sharpe={float(is_sharpe):.2f} ≤ 0，"
+                            f"训练窗口本身无超额收益信号（非过拟合），该窗口结果直接废弃"
+                        )
+                        logger.warning("=" * 64)
+                    elif _otype == _OverfitType.OVERFITTED:
+                        logger.warning("=" * 64)
+                        logger.warning(
+                            f"  [{path_idx + 1}-{win_idx}] OOS 衰减校验 FAIL(OVERFITTED) | "
+                            f"IS_Sharpe={float(is_sharpe):.2f} → OOS_Sharpe={oos_sharpe:.2f}，"
+                            f"衰减率={_decay_report.decay_rate:.1%}，"
+                            f"训练期内拟合出的参数组合泛化能力不足，窗口结果废弃"
+                        )
+                        logger.warning("=" * 64)
+                    else:  # WEAK
+                        logger.warning(
+                            f"  [{path_idx + 1}-{win_idx}] OOS 衰减校验 FAIL(WEAK) | "
+                            f"IS_Sharpe={float(is_sharpe):.2f} → OOS_Sharpe={oos_sharpe:.2f}，"
+                            f"策略信号偏弱，结果仅供参考"
+                        )
+                else:
+                    logger.warning(
+                        f"  [{path_idx + 1}-{win_idx}] OOS 衰减校验未通过"
+                        f"（IS_Sharpe={float(is_sharpe):.2f} → OOS_Sharpe={oos_sharpe:.2f}），"
+                        f"该窗口结果直接废弃"
+                    )
+
                 _consecutive_oos_failures += 1
                 if _consecutive_oos_failures >= _MAX_CONSECUTIVE_OOS_FAILURES:
                     logger.critical(
@@ -644,6 +666,56 @@ def bayesian_walk_forward_multi(
                         failed_windows=_consecutive_oos_failures,
                     )
                 continue
+
+            # ── DM 检验（P2.2）：仅在 IS_Sharpe > 0 时执行 ──
+            # 当 IS_Sharpe ≤ 0 时 OOS gate 已拦截，不会到达此处。
+            # DM 检验判定"最优"是否只是噪声尖峰，仅在策略有效时才有意义。
+            _dm_stat: float | None = None
+            _dm_p_value: float | None = None
+            _dm_pass: bool = True
+            _is_positive = float(is_sharpe) > 0 if is_sharpe is not None else False
+            if _is_positive:
+                try:
+                    from BackTrading.overfitting import compute_dm_test as _dm_test
+
+                    _mid_params = {n: (sp.low + sp.high) / 2 for n, sp in spaces.items()}
+                    _base_results = _oos_validate(
+                        test_data, [_mid_params], base_cfg, top_m=1,
+                        eval_start_date=test_eval_start,
+                        st_history=st_history, exclude_st=exclude_st,
+                        data_version=data_version,
+                        listing_days=listing_days,
+                        db_engine=db_engine,
+                    )
+                    _rank1_ec = oos_results[0].get("oos_equity", []) if oos_results else []
+                    _base_ec = _base_results[0].get("oos_equity", []) if _base_results else []
+                    if len(_rank1_ec) >= 10 and len(_base_ec) >= 10:
+                        _ra = np.diff(np.array([e.get("portfolio_value", 0) for e in _rank1_ec], dtype=float)) / \
+                              np.maximum(np.array([e.get("portfolio_value", 0) for e in _rank1_ec[:-1]], dtype=float), 1e-9)
+                        _rb = np.diff(np.array([e.get("portfolio_value", 0) for e in _base_ec], dtype=float)) / \
+                              np.maximum(np.array([e.get("portfolio_value", 0) for e in _base_ec[:-1]], dtype=float), 1e-9)
+                        _dm_stat, _dm_p_value = _dm_test(_ra, _rb)
+                        _dm_pass = bool(_dm_p_value < 0.05 and _dm_stat > 0)
+                        if not _dm_pass:
+                            logger.warning(
+                                f"  [{path_idx + 1}-{win_idx}] DM检验: rank-1 相对基准中位数无显著优势"
+                                f"（stat={_dm_stat:.2f}, p={_dm_p_value:.3f}），窗口不参与稳健中位数主路径"
+                            )
+                except Exception as _dme:
+                    logger.warning(f"  [{path_idx + 1}-{win_idx}] DM 检验异常: {_dme}，跳过")
+            else:
+                logger.info(
+                    f"  [{path_idx + 1}-{win_idx}] 跳过 DM 检验（IS_Sharpe={float(is_sharpe):.2f} ≤ 0，"
+                    f"OOS gate 已拦截，无需 DM 对比）"
+                )
+
+            # ── 时间预算（P2.4）：窗口粒度检查，超时提前终止 ──
+            if time_budget_seconds > 0 and (time.monotonic() - _t_wfo_start) > time_budget_seconds:
+                logger.critical(
+                    f"时间预算 {time_budget_seconds/3600:.1f}h 已耗尽，"
+                    f"提前终止 WFO（已收集 {len(all_path_results)} 组窗口结果）"
+                )
+                _time_up = True
 
             # ── 收集 IS Sharpe（优化器返回的真实样本内绩效） ──
             train_sharpe = float(is_sharpe)
@@ -756,15 +828,14 @@ def bayesian_walk_forward_multi(
                 if _agg_decay > 0.30:
                     logger.critical(
                         f"[OOS衰减校验] 聚合衰减 {_agg_decay:.1%}（IS均值={_agg_is:.2f} → "
-                        f"OOS均值={_agg_oos:.2f}）> 30%，判定超参数过度网格搜索或特征工程隐性泄露，"
+                        f"OOS均值={_agg_oos:.2f}）> 30%，模型泛化能力不足，"
                         f"本次寻优结果整体废弃"
                     )
                     mid = {n: (sp.low + sp.high) / 2 for n, sp in spaces.items()}
                     raise WFOSystematicFailure(
                         fallback_params=mid,
                         reason=f"聚合 IS/OOS 衰减 {_agg_decay:.1%}（IS均值={_agg_is:.2f} → "
-                               f"OOS均值={_agg_oos:.2f}）超过 30% 阈值；"
-                               f"疑似超参数过度网格搜索或特征工程隐性泄露",
+                               f"OOS均值={_agg_oos:.2f}）超过 30% 阈值；模型泛化能力不足",
                         failed_windows=len(agg_rows),
                     )
     return result

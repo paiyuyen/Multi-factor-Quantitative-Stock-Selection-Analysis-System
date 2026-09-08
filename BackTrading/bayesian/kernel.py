@@ -27,11 +27,13 @@ def _default_kernel(n_dims: int, nu: float = 1.5) -> Kernel:
         可组合的 sklearn Kernel。
     """
     length_scale = np.ones(n_dims)
+    # P4-Fix: 白噪音下限从 1e-6 提高到 1e-4，防止 GP 过度拟合观测值
+    # 导致代理函数太"尖锐"、L-BFGS-B 找到虚假极值。
     return ConstantKernel(constant_value=1.0, constant_value_bounds=(1e-3, 1e3)) * Matern(
         length_scale=length_scale,
         length_scale_bounds=(1e-3, 1e3),
         nu=nu,
-    ) + WhiteKernel(noise_level=1e-3, noise_level_bounds=(1e-6, 10.0))
+    ) + WhiteKernel(noise_level=1e-2, noise_level_bounds=(1e-4, 1e-1))
 
 
 # ── 序列化状态结构 ──

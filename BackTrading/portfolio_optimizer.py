@@ -548,7 +548,6 @@ class PortfolioOptimizer:
             return_term = -w @ mu
             risk_term = (self.cfg.risk_aversion / 2.0) * w @ cov @ w
             turnover = self.cfg.turnover_penalty * np.sum(np.abs(w - w0))
-            # P1-4 修复：融券成本项（日成本）
             if self.cfg.short_allowed:
                 short_cost_daily = self.cfg.short_cost_annual / 244.0  # A股年化交易日244
                 short_pos = np.minimum(w, 0)
@@ -585,7 +584,6 @@ class PortfolioOptimizer:
                         self.cfg.max_weight * 3 - np.sum(w[g]),
                 })
 
-        # P1-4 修复：bounds 根据 short_allowed 配置
         if self.cfg.short_allowed:
             bounds = [(-self.cfg.max_weight, self.cfg.max_weight)] * n
         else:
@@ -614,7 +612,6 @@ class PortfolioOptimizer:
             w_opt = np.clip(result.x, 0, None)
             if w_opt.sum() > 0:
                 w_opt = w_opt / w_opt.sum() * target_sum
-            # P1-17 修复：清理微小权重后重归一化
             w_opt[w_opt < 0.001] = 0
             if w_opt.sum() > 0:
                 w_opt = w_opt / w_opt.sum() * target_sum
@@ -893,7 +890,6 @@ class PortfolioOptimizer:
         n = len(symbols)
         if n == 0:
             return {}
-        # P1-17 修复：当 n < 1/max_weight 时，min(1/n, max_weight) 导致权重和 < 1。
         # 先取上限，再归一化确保 Σw = 1。
         w_raw = min(1.0 / n, self.cfg.max_weight)
         w_sum = w_raw * n

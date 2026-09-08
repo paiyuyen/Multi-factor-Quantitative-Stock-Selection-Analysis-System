@@ -86,7 +86,9 @@ def _regime_series(
     is_narrow = pd.Series(False, index=df.index)
     if boll_bw_col and boll_bw_col in df.columns:
         bw = df[boll_bw_col]
-        hist_bw = bw.expanding().mean().shift(1)
+        # P4-Fix: expanding().mean() 随数据量增加收敛到全样本均值，
+        # 早期 bar 的窄带判定受后期数据影响。改为有限窗口 rolling(252) + history shift。
+        hist_bw = bw.rolling(252, min_periods=10).mean().shift(1)
         narrow_ratio = float(params.get("boll_narrow_ratio", 0.8))
         is_narrow = bw < hist_bw * narrow_ratio
 
@@ -492,9 +494,10 @@ def _kline_pattern(df: pd.DataFrame, max_score: int = 10) -> np.ndarray:
     prev_body = shift_v(body, 1)
     prev2_bullish = shift_v(bullish, 2).astype(bool)
     _body_ma = pd.Series(body).rolling(20, min_periods=5).mean()
-    # 因果回退：早期不足 20 根的窗口用"截至当日"的滚动均值（expanding），
-    # 不使用全样本 mean（np.nanmean(body)）以免引入未来数据的前视泄漏。
-    body_ma20 = _body_ma.fillna(_body_ma.expanding().mean()).values
+    # P4-Fix: 原代码 fillna(expanding().mean()) 用后期均值"推回"早期 bar 的缺失值，
+    # 造成前视偏差。改为填充 body 序列自身的 rolling 均值近似（早期样本少的 bar 用 NaN
+    # 填充后统一设为 0，即早期 bar 不参与晨星/夜星判定，保守但因果安全）。
+    body_ma20 = _body_ma.fillna(0.0).values
     mid_body_small = prev_body < (body_ma20 * 0.3)
     # 晨星：长阴 → 小实体（跳空低开） → 长阳（收过第一根中点）
     cond_ms = (~prev2_bullish) & mid_body_small & bullish & (close > (prev2_open + prev2_close) / 2.0)
@@ -792,9 +795,10 @@ def compute_signals(
             _denom = stock_df["_p0_golden_denom"]
         else:
             _gs = (dif - dea).abs() / atr.replace(0, np.nan)
-            # 扩展窗口分位数（因果）：只用截至当日的数据归一化，避免全样本
-            # 75% 分位数引入未来波动率分布的前视偏差。
-            _denom = _gs.expanding(min_periods=20).quantile(0.75)
+            # P4-Fix: expanding(min_periods=20).quantile(0.75) 收敛到全样本 75% 分位数，
+            # WFO 中训练窗口的 expanding 分布受全周期数据影响，信号已对训练窗口做过拟合。
+            # 改为滚动窗口 252 天（1 年），限制最大窗口长度。
+            _denom = _gs.rolling(252, min_periods=20).quantile(0.75)
         _denom = _denom.fillna(vol_norm_denom).clip(lower=1e-9)
         if len(_denom) > 0 and float(_denom.iloc[-1]) > 0:
             vol_norm_denom = _denom.values
@@ -1016,6 +1020,8 @@ def compute_param_independent_features(stock_df: pd.DataFrame) -> pd.DataFrame:
     out["_p0_vol_price"] = _volume_price(_fdf, max_score=10)
     out["_p0_kline_pattern"] = _kline_pattern(_fdf, max_score=10)
     _gs = (dif - dea).abs() / atr.replace(0, np.nan)
-    out["_p0_golden_denom"] = _gs.expanding(min_periods=20).quantile(0.75)
+    # P4-Fix: expanding().quantile(0.75) 收敛到全样本 75% 分位数，
+    # WFO 训练窗口信号做过拟合。改为 rolling(252) 限制 1 年窗口。
+    out["_p0_golden_denom"] = _gs.rolling(252, min_periods=20).quantile(0.75)
     out.attrs["_p0_feat_const"] = _const
     return out

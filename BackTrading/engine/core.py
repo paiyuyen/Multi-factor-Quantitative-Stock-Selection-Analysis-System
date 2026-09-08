@@ -36,7 +36,6 @@ EquityCurve: TypeAlias = list[dict[str, Any]]
 
 # 20 日均量（行业口径：不含当日的滚动均值，避免用当日成交量前视）
 _ADV_WINDOW = 20
-# P0.3 修复：涨跌停可成交量fallback保守默认值（股）。
 # 当日量开盘时不可知（前视）；前日无数据时（停牌复牌/新股首日）
 # 使用 500手×100 = 50,000 股作为保守成交代理。
 _DEFAULT_VOLUME_FALLBACK: float = 50_000.0
@@ -45,22 +44,9 @@ _DEFAULT_VOLUME_FALLBACK: float = 50_000.0
 # 固定滑点强制下限（1.8 交易摩擦合规：A股隐性成本不低于单边 0.05%，
 # 配置/回退路径任何低于此值的基础滑点一律抬升，防止 Alpha 虚高）
 _MIN_SLIPPAGE_FLOOR = 0.0005
-# ── 0.1 两档成交模型（P0-6 ②：A股订单时效与停牌废单语义） ──
-# 档位 1「次日集合竞价委托」：信号日收盘挂单 → 次日 9:15-9:25 集合竞价撮合，
-#   成交价 = 次日开盘价（开=集合竞价价）。订单仅在信号次日的集合竞价有效：
-#   - 次日未成交（一字涨停/跌停封死）→ 撤销（A股订单当日有效，隔夜作废）
-#   - 次日停牌（无行情/无成交量）→ 废单撤销（A股停牌日委托无效）
-#   - 例外：强平单（ST/退市）遇一字跌停/停牌 → 逐日重挂直至成交（终态必须离场）
-# 档位 2「盘中市价委托」：不在日频模型内主动建模盘中成交；触板日的成交率由
-#   次日开盘集合竞价档近似（auction_fill_ratio_for，仅用 9:25 已知的 open/限价，
-#   P1-2 前视修复）。盘中档 fill_ratio（依赖当日 close/high/low，属未来信息）
-#   为死计算已删除（P2 审计）。
-# 挂单过期天数（P0-6 ②：3 交易日 → 次日过期）：普通挂单信号次日未成交即撤销。
-# P3-3（审计）：从硬编码提升为 EngineConfig.order_expiry_days（默认 1，保持原语义）。
 import threading
 from contextlib import contextmanager
 
-# P3（审计修复）：全局告警标志使用 threading.local() 隔离会话
 # 避免多窗口 WFO 或并行回测时标志跨会话污染。
 _ENGINE_SESSION = threading.local()
 
@@ -78,10 +64,8 @@ def _round_half_up(x: float, ndigits: int = 2) -> float:
         return float(x)
     q = Decimal("0.01") if ndigits == 2 else Decimal(1).scaleb(-ndigits)
     return float(Decimal(str(x)).quantize(q, rounding=ROUND_HALF_UP))
-# P0-6 ⑤ 市场状态客观变量：市场收益窗口（日）与波动率分位窗口（交易日）
 _REGIME_RET_WINDOW = 20
 _REGIME_VOL_WINDOW = 250
-# P0-11：市场波动率分位所需最小样本数（不足时返回中性分位，避免早期极端 regime）
 _REGIME_VOL_MIN = 60
 
 
@@ -108,7 +92,7 @@ def _valid_px_mask(px_arr: np.ndarray) -> np.ndarray:
 
 
 def _regime_multiplier_for(mkt_ret20: float, vol_pct: float, engine_cfg: EngineConfig) -> float:
-    """P0-6 ⑤ 市场状态仓位倍率（客观状态变量，替代"前日全市场评分中位数"）。
+    """
 
     Args:
         mkt_ret20: 指数 20 日收益代理（全市场后复权收盘 ret_20d 中位数）。
@@ -309,7 +293,6 @@ def _build_day_limit_model(
     limit_down = np.full(n, -np.inf)
     prev_close_arr = np.full(n, np.nan)
 
-    # P2 审计修复：向量化涨跌停价批量计算
     # 第一步：收集有前收的 stock 并批量计算
     _valid_idx = []
     _pc_list = []
@@ -336,7 +319,6 @@ def _build_day_limit_model(
         if _ldays is not None:
             _exempt = _ldays <= listing_exempt_days(day_str)
 
-        # P0-6 ① 退市整理期涨跌幅（优先级最高：首日无限制 / 期间 ±10%，独立于 ST 5%）
         if delist_first_syms is not None and s in delist_first_syms:
             _ratio_up_list.append(1.0)
             _ratio_down_list.append(1.0)
@@ -391,7 +373,6 @@ def _build_day_limit_model(
     if sim_limits:
         for j in range(n):
             if touched_up[j] or touched_down[j]:
-                # P2 审计修复：盘中档 fill_ratio（fill_ratio_for，依赖当日
                 # close/high/low）为死计算——撮合层仅消费次日开盘竞价档
                 # auction_fill_ratio_for（P1-2 前视修复），且 _limit_fill 从未
                 # 被 _flush_pending 使用，全市场逐股计算纯 CPU 浪费，已删除。
@@ -435,7 +416,6 @@ def _run_single_backtest(
     从 params dict 读取。调用方（如 simulated_trading/limit_stress）
     需确保 params dict 含这些键。
     """
-    # P3 审计：告警标志使用 _ENGINE_SESSION 隔离会话（见模块级 _ENGINE_SESSION 定义）
     if pd.api.types.is_datetime64_any_dtype(data["trade_date"]):
         data = data.copy()
         data["trade_date"] = data["trade_date"].dt.strftime("%Y-%m-%d")
@@ -482,7 +462,6 @@ def _run_single_backtest(
         date_groups = list(data.groupby("trade_date", sort=True))
 
     symbols = sorted(data["symbol"].unique().tolist())
-    # P1-4 修复：引擎启动时刷新行业映射缓存（从 params 注入 db_engine）
     _db_engine = params.get("_db_engine") if isinstance(params, dict) else None
     if engine_cfg.optimizer_industry_neutral:
         _refresh_industry_cache(_db_engine, symbols)
@@ -491,27 +470,10 @@ def _run_single_backtest(
     n_syms = len(symbols)
     pos_value = np.zeros(n_syms, dtype=np.float64)
     pos_shares = np.zeros(n_syms, dtype=np.int32)
-    # #5 审计修复：标记碎股状态（持仓不足一手，无法独立交易）
     # True 表示该标的有碎股（< lot 股），买入时应跳过（已有持仓），
     # 卖出碎股时随全仓卖出一起清理
     pos_has_fractional = np.zeros(n_syms, dtype=bool)
 
-    # ── ST/退市逐日动态状态机（stock_st_history 由 runner 注入 params） ──
-    # P0-6 ① 退市整理期业务规则（P1-4 修复：整理期 15/30 交易日，退市新规分段）：
-    #   - 整理期（is_delisting=True 的交易日区间，自摘牌日前 N 个交易日
-    #     至摘牌日；N=15（2020-12-31 退市新规及以后摘牌）/ 30（此前摘牌），
-    #     由 DataManager/StPitSync 按终止上市日期回填，引擎只消费区间不推算）：
-    #       * 首日无涨跌幅限制（±100% 近似，独立于 ST 5%）
-    #       * 次日起 ±10%（进入整理期后不再适用 ST 5%）
-    #       * 期间正常交易：可买可卖，不做强平（整理期股票仍可交易）
-    #   - 摘牌日（整理期区间最后一个交易日）：当日禁止买入 + 当日收盘价强平
-    #     （次日无行情可卖，强平为终态事件，以当日收盘价成交是保守近似）
-    #   - 摘牌日之后（K线滞后延伸等兜底）：永久禁买 + 强平（维持原终态语义，
-    #     避免"强平→次日复购→再强平"的循环刷交易）
-    #   - ST/*ST 日（is_st=True 且非退市整理期）：仅当 _exclude_st=True 时
-    #     禁止买入并强平（A股 ST 涨跌幅 5%）；exclude_st=False 时 ST 股全程正常交易
-    # 预构建 {交易日: symbol 集合}，逐日 O(1) 查询；
-    # 掩码用 np.isin 按当日行生成，长度与股票池/PIT 过滤后行数无关
     _st_hist = params.get("_st_history") if isinstance(params, dict) else None
     _exclude_st = bool(params.get("_exclude_st", False)) if isinstance(params, dict) else False  # FIX(P0): 默认不排除 ST
     # 退市整理期日集合（含首日/摘牌日）→ 整理期可交易 + 涨跌幅规则
@@ -566,14 +528,11 @@ def _run_single_backtest(
     # 开启：触板日按 可成交量比例(一字/盘中 × 连板衰减) 部分成交或未成交（日志可追溯）
     # 关闭：回退简化撮合（触板日一律禁止买入/卖出，等价原行为）
     _sim_limits = bool(getattr(engine_cfg, "simulate_limit_up_down", True))
-    # P1-2 修复：涨跌停方向流动性不对称——拆分为涨跌停独立成交率
     _tradable_up_ratio = float(getattr(engine_cfg, "limit_tradable_up_ratio", 0.30))
     _tradable_down_ratio = float(getattr(engine_cfg, "limit_tradable_down_ratio", 0.30))
-    # P1-2 修复：一字板封死也拆分买卖方向——买入排队极难（逆势），卖出相对容易（提供流动性）
     _seal_sell_ratio = float(getattr(engine_cfg, "limit_seal_sell_ratio", 0.05))
     _seal_buy_ratio = float(getattr(engine_cfg, "limit_seal_buy_ratio", 0.02))
     _seal_decay = float(getattr(engine_cfg, "limit_seal_decay", 0.5))
-    # P0-6 ⑥：开盘集合竞价成交率分档（封单量/可成交量代理）——开盘价触板日，
     # 集合竞价可成交量 = 当日成交量 × min(触板档比例, auction_fill_ratio)
     _auction_ratio = float(getattr(engine_cfg, "auction_fill_ratio", 0.12))
     # ── 经验填充模型（技术债修复）：limit_ratio_mode=empirical_median/p10 时，
@@ -598,17 +557,13 @@ def _run_single_backtest(
         except Exception as _ce:
             logger.warning(f"[经验填充] 校准表构建失败，回退 fixed 档: {_ce}")
             _emp_calib = None
-    # ── 0.6 复牌跳空：停牌后复牌日开盘大幅跳空（补涨兑现卖出 / 补跌日志标记 / 追高禁买） ──
     # 阈值 0 = 关闭该决策（仅识别复牌不动作）
     _resume_gap_up = float(getattr(engine_cfg, "resume_gap_up", 0.05))
     _resume_gap_down = float(getattr(engine_cfg, "resume_gap_down", 0.05))
-    # P1-6 修复：复牌跳空卖出流动性冲击放大系数
     _resume_impact_multiplier = float(getattr(engine_cfg, "resume_impact_multiplier", 2.0))
-    # ── P2-1 停牌盯市：停牌天数保守衰减折扣（无行业指数数据时的务实替代方案） ──
     _susp_decay_start = int(getattr(engine_cfg, "susp_decay_start_days", 10))
     _susp_daily_decay = float(getattr(engine_cfg, "susp_daily_decay_rate", 0.002))
     _susp_max_discount = float(getattr(engine_cfg, "susp_max_discount", 0.30))
-    # ── 0.1 成交时点模型 ──
     # next_open=信号次日开盘成交（默认，A股T+1）/ vwap=信号次日VWAP。
     # next_open/vwap 将当日信号挂单，次日开盘按成交模型撮合，
     # 并与 simulate_limit_up_down 联动：次日一字涨停不可买入、一字跌停不可卖出。
@@ -626,26 +581,22 @@ def _run_single_backtest(
         _exec_model = "next_open"
     _defer = True  # next_open/vwap 均为 deferred（信号日挂单→次日成交）
     _limit_streak: dict[str, int] = {}  # 连续涨停(+) / 连续跌停(-) 板数
-    # P1-2（审计）：竞价路径用前日 streak 快照——_build_day_limit_model 在当日撮合
     # 前已用当日收盘封板状态更新 _limit_streak，竞价若直接读取即为前视。
     _limit_streak_prev: dict[str, int] = {}
     # 上市日映射（仅显式注入 {symbol: "YYYY-MM-DD"}，由 runner 从 stock_listing_days
     # 表加载，来源 AkShare stock_info_a_code_name 的上市日期）
-    # P0-6 ④：禁止从行情数据推断上市日期——数据缺口/中途加入的股票会被误判为新股，
     # 错误激活"注册制前 5 日无涨跌幅"豁免（放大收益）。无注入 → 新股豁免逻辑整体停用
     # （仅"数据首日无前收"天然无涨跌停），并告警一次。
     _listing_days_map = params.get("_listing_days") if isinstance(params, dict) else None
     _day_idx = {str(dt): i for i, (dt, _g) in enumerate(date_groups)}
     if _listing_days_map is None:
         if engine_cfg.strict_listing_days:
-            # P3-4（审计）：严格模式 fail-fast——上市日表缺失即中止回测，
             # 与数据质量门禁联动；杜绝"表缺失 → 静默停用新股豁免 → 结果口径漂移"。
             raise RuntimeError(
                 "[上市日] strict_listing_days=True 但 params._listing_days 未注入"
                 "（来源 stock_listing_days / AkShare stock_info_a_code_name）——"
                 "新股涨跌停豁免口径不可用，中止回测"
             )
-        # P3-5（修复）：threading.local 在从未赋值的线程直接读属性抛 AttributeError
         # （walk-forward 多窗口并发线程首次进入即崩）。getattr 默认 False 保证
         # 每线程首次访问安全，赋值后同线程内仍只告警一次。
         if not getattr(_ENGINE_SESSION, "listing_days_warned", False):
@@ -687,32 +638,21 @@ def _run_single_backtest(
     }
     # 滚动 20 日成交量（不含当日，前视合规）：value = (deque, run_sum)
     _adv_state: dict[str, tuple[Any, float]] = {}
-    # P0-6 ⑤：每只滚动 _REGIME_RET_WINDOW+1 日复权收盘（市场收益/波动率客观口径）
     _close_hist: dict[str, deque] = {}
     _regime_vol_hist: deque = deque(maxlen=_REGIME_VOL_WINDOW)
     _prev_bar: dict[str, tuple[float, float]] = {}
-    # P2-1：复权价 prev_bar 仅供 ATR 止损使用（跨除权日连续，无机械跳降）
     _prev_bar_adj: dict[str, tuple[float, float]] = {}
-    # P1-X：每只标的上一交易日 adj_factor（除权日涨跌停基准校正）
     _prev_af: dict[str, float] = {}
-    # ── 审计修复（P0-1）：_prev_af 防御性初始化守卫 ——
     # 防止旧版本残留路径/异常回滚状态将 _prev_af 置为 None 导致 L1774 崩溃
     _prev_af_guard = [True]  # 单元素 list 用于内部函数 nonlocal 共享
-    # P0-11：每只标的上一交易日成交量（真实价体系下涨跌停开盘可成交量的前视合规代理）
     _prev_volume: dict[str, float] = {}
-    # P0-11：每只持仓标的最近一次结算日复权因子（真实价体系除权股数调整基准）
     _pos_adjf: dict[str, float] = {}
-    # P0-1：上一交易日止损线（后复权空间），今日 close_adj 跌破 → 次日开盘卖出
     _prev_stop: dict[str, float] = {}
-    # 0.6 复牌跳空：每只标的最近一次有行情（bar）的交易日，用于识别停牌复牌
     _prev_bar_date: dict[str, str] = {}
-    # P1-1 修复：持仓跟踪止损（Trailing Stop）
     # 入场以来的最高收盘价，用于动态上移止损价
     _max_close_since_entry: dict[str, float] = {}
-    # P2 修复：跟踪止盈 — 入场收盘价，用于计算浮盈比例
     _entry_close: dict[str, float] = {}
     _buy_date: dict[str, str] = {}
-    # P2-2：建仓时 buy_score 快照，退出时 exit_gt 与此值比较（而非当日 buy_score）
     _entry_buy_score: dict[str, float] = {}
     # FIX(P1) Subtask-9：持有期限计数（按标的逐日递增，>max_hold_days 重新评估）
     _held_days: dict[str, int] = {}
@@ -723,7 +663,6 @@ def _run_single_backtest(
     init_cash = engine_cfg.initial_cash
 
     _atr_stop = engine_cfg.atr_stop_mult
-    # P2 修复：跟踪止盈参数
     _take_profit_pct = float(getattr(engine_cfg, "take_profit_pct", 15.0)) / 100.0
     _trail_profit_ratio = float(getattr(engine_cfg, "trail_profit_ratio", 50.0)) / 100.0
     # P1-5 max_order_pct 分档：按 ADV 成交额选择流动性分档上限
@@ -737,9 +676,6 @@ def _run_single_backtest(
     cash = float(init_cash)
     _last_total_value = cash  # Task F 日历轴补全日：权益按上一日市值结转
 
-    # ═══════════════════════════════════════════════════════════
-    # P2.8 TODO: 嵌套函数拆分边界标记（后续重构为独立类）
-    # ═══════════════════════════════════════════════════════════
     # ── ADV 管理 ── _update_adv / _current_adv
     #   → 提取至 engine/adv_manager.py (AdvManager)
     # ── 持仓盯市 ── _calc_market_value / _susp_position_value
@@ -754,12 +690,10 @@ def _run_single_backtest(
     #   → 提取至 engine/stats_sink.py (轻量 dict 封装)
     # 拆分原则：各嵌套函数仅通过闭包引用引擎状态变量；
     # 重构后改为显式注入状态对象，消除隐式耦合。
-    # ═══════════════════════════════════════════════════════════
 
     def _update_adv(sym: str, vol: float) -> float:
         """滚动 _ADV_WINDOW 日均量（不含当日）。当日 bar 结束后入账，供次日使用。
 
-        P2.7 修复：vol <= 0 时不推进滑动窗口（停牌/零量日 forward fill 上次有效 ADV），
         避免停牌期 0 值拉低 ADV → 复牌后冲击成本/分档上限失真。
         """
         dq, run = _adv_state.get(sym, (None, 0.0))
@@ -815,9 +749,7 @@ def _run_single_backtest(
     close_lookup: dict[str, float] = {}
     # 0.4 停牌盯市：每只有行情交易日收盘后更新为当日复权收盘价，供停牌日估值回退
     _last_close: dict[str, float] = {}
-    # P2-1：停牌天数追踪（用于保守衰减折扣，无行业指数数据时的务实替代方案）
     _susp_days: dict[str, int] = {}
-    # P3 审计修复：记录每标的最新冲击参数（波动倍率/AMOUNT_MA20），供主循环结束后
     # 摘牌末段强平统一传入（与常规卖出口径一致，不再默认 1.0/None）
     _last_amp_mult: dict[str, float] = {}
     _last_amount: dict[str, float] = {}
@@ -843,7 +775,6 @@ def _run_single_backtest(
         dt: str | None = None,
         volatility_multiplier: float = 1.0,
     ) -> tuple[float, float]:
-        # P1.2 断言：value 必须为不复权原始价 × 股数，禁止传入复权价格
         assert np.isfinite(value) and value >= 0, (
             f"[P1.2] _sell_proceeds_and_cost 收到非法 value={value}，检查是否传入复权价"
         )
@@ -865,7 +796,6 @@ def _run_single_backtest(
         sym: str, value: float, volume: float, amount_ma20: float | None = None,
         dt: str | None = None, volatility_multiplier: float = 1.0,
     ) -> float:
-        # P1.2 断言：value 必须为不复权原始价 × 股数
         assert np.isfinite(value) and value >= 0, (
             f"[P1.2] _buy_cost 收到非法 value={value}，检查是否传入复权价"
         )
@@ -938,6 +868,7 @@ def _run_single_backtest(
                 if _avail < lot:
                     _sink_inc("sell_limit_rejected", 1)
                     _sink_val("sell_limit_unfilled_value", float(_req) * float(s_close[j]))
+
                     _u_sell += float(_req) * float(s_close[j])
                     _day_agg["reject_sell"] += 1
                     logger.debug(

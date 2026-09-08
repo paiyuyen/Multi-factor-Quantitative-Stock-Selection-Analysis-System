@@ -17,7 +17,7 @@ from BackTrading.bayesian.kernel import (
     save_gp_state,
 )
 from BackTrading.bayesian.acquisition import mixed_acquisition, optimize_acquisition
-from BackTrading.bayesian.space import ParamSpace, split_by_cost
+from BackTrading.bayesian.space import ParamSpace, split_by_cost, _get_fixed_params
 
 
 # ── 参数归一化工具 ──
@@ -85,31 +85,60 @@ def _unique_x_agg(X: np.ndarray, Y: np.ndarray) -> tuple[np.ndarray, np.ndarray]
     return Xa[idx], Y_agg
 
 
-# ── 局部精细化（L-BFGS-B on GP 代理） ──
+# ── 局部随机探索（替代 L-BFGS-B 爬山） ──
+# L-BFGS-B 在 GP 代理上会走向虚假夏普峰值（核函数平滑伪极值），
+# 改为 ε-邻域 Sobol 采样：在已知最优附近随机扰动，不信任代理曲率。
 
 def _local_refine(
     base_x: np.ndarray,
-    gp_signal,  # GaussianProcessRegressor
+    gp_signal,  # GaussianProcessRegressor（仅用于获取 mu/sigma）
     signal_bounds: np.ndarray,
-    n_iters: int = 10,
+    n_samples: int = 20,
+    epsilon: float = 0.1,
+    seed: int = 42,
+    n_random: int = 8,
 ) -> np.ndarray:
-    """在 GP 代理模型上做 L-BFGS-B 爬山。"""
-    best_x = base_x.copy()
-    best_val = float(gp_signal.predict(best_x.reshape(1, -1), return_std=False)[0])
+    """在已知最优的 ε-邻域内做 Sobol 采样，替代 L-BFGS-B。
 
-    for _ in range(n_iters):
-        res = minimize(
-            lambda x: -float(gp_signal.predict(x.reshape(1, -1), return_std=False)[0]),
-            best_x,
-            method="L-BFGS-B",
-            bounds=signal_bounds,
-            options={"maxiter": 50, "ftol": 1e-10},
-        )
-        if res.success:
-            val = float(gp_signal.predict(res.x.reshape(1, -1), return_std=False)[0])
-            if val > best_val:
-                best_x = res.x
-                best_val = val
+    问题：L-BFGS-B 驱动参数走向 GP 核函数平滑产生的"虚假夏普峰值"，
+    真实函数在该区域平坦或负 Sharpe。随机扰动不信任代理曲率，
+    只在已验证最优附近探索，并用风险调整评分（mu - λ·sigma）。
+    """
+    rng = np.random.RandomState(seed)
+    d = len(base_x)
+
+    # 方案 1：Sobol 采样 ε-邻域
+    n_pow2 = 1
+    while n_pow2 < n_samples:
+        n_pow2 <<= 1
+    sampler = Sobol(d, seed=seed, scramble=True)
+    sobol_pts = sampler.random(n_pow2)[:n_samples]
+
+    candidates: list[np.ndarray] = []
+    for s in sobol_pts:
+        perturbed = np.clip(base_x + (s - 0.5) * 2 * epsilon, 0.0, 1.0)
+        candidates.append(perturbed)
+
+    # 方案 2：少量纯随机探索（防止局部最优）
+    for _ in range(n_random):
+        rand_x = rng.uniform(0, 1, d)
+        blended = 0.7 * base_x + 0.3 * rand_x
+        candidates.append(blended)
+
+    # 用 GP 代理评分，取最优（风险调整：高不确定区域降分）
+    best_x = base_x.copy()
+    best_val = -1e10
+    for cx in candidates:
+        cx_reshaped = cx.reshape(1, -1)
+        try:
+            mu, sigma = gp_signal.predict(cx_reshaped, return_std=True)
+            adjusted = mu[0] - 0.1 * sigma[0]  # 风险调整
+            if adjusted > best_val:
+                best_val = adjusted
+                best_x = cx.copy()
+        except Exception:
+            continue
+
     return best_x
 
 
@@ -158,6 +187,10 @@ def optimize_window(
     """
     import pandas as pd  # type: ignore[import]
 
+    # P4-Fix: 注入被固定的低敏感参数（space.py 已排除出搜索空间，
+    # 但 backtest 引擎仍需要这些字段）
+    _fixed_params = _get_fixed_params()
+
     signal_sp, portfolio_sp = split_by_cost(spaces)
     signal_names = list(signal_sp.keys())
     portfolio_names = list(portfolio_sp.keys())
@@ -172,7 +205,8 @@ def optimize_window(
     best_params_local: dict[str, float] = {}
     best_equity_local: Any = None
     X_hist: list[np.ndarray] = []
-    Y_hist: list[float] = []
+    Y_hist: list[float] = []          # GP 训练目标（DSR）
+    Sharpe_hist: list[float] = []    # 审计修复：原始 Sharpe 用于 Top-K 排序
     params_hist: list[dict[str, float]] = []
 
     # ── 评估去重：同一参数组合只算一次 ──
@@ -181,24 +215,48 @@ def optimize_window(
     _seen: dict[tuple[tuple[str, float], ...], dict[str, Any]] = {}
     _consecutive_skips = 0
 
+    # ── DSR 惩罚（P4-Fix）：用 deflated_sharpe_ratio 替代原始 Sharpe 作为 GP 目标 ──
+    # 随评估次数增加，DSR 惩罚加大，自动抑制过度搜索同一区域。
+    # 原始 Sharpe 仍保留用于 best_sharpe_local 比较（业务口径）。
+    # 审计修复：n_obs 应为唯一交易日数，非多股票面板总行数。
+    # 原 len(kline_df) 可能为 N_stocks × N_days（数万），导致 sigma_sr 严重失真。
+    _n_days_train = int(kline_df["trade_date"].dropna().unique().__len__())
+    _eval_count = 0
+
+    from BackTrading.overfitting import deflated_sharpe_ratio as _dsr_calc
+
+    def _dsr_of(sharpe: float) -> float:
+        """计算 deflated sharpe：评估次数越多，惩罚越重，抑制网格搜索式遍历。"""
+        _eval_count_ref = max(_eval_count, 1)
+        return _dsr_calc(sharpe, _n_days_train, _eval_count_ref)
+
     def _params_key(p: dict[str, float]) -> tuple[tuple[str, float], ...]:
         return tuple(sorted((k, round(float(v), 8)) for k, v in p.items()))
 
     def _eval_once(params: dict[str, float], fidelity: int) -> dict[str, Any]:
-        key = _params_key(params)
+        # P4-Fix: 注入被固定的低敏感参数（space.py 已排除出搜索空间，
+        # 但 backtest 引擎仍需要这些字段）。固定参数优先级低于搜索参数。
+        merged = {**_fixed_params, **params}
+        key = _params_key(merged)
         hit = _seen.get(key)
         if hit is not None:
             logger.debug(f"  [去重] 参数已评估过，复用结果: sharpe={hit['sharpe']:.4f}")
             return hit
-        result = controller.evaluate(params, fidelity=fidelity)
+        result = controller.evaluate(merged, fidelity=fidelity)
         _seen[key] = result
         return result
 
     def _track(sharpe: float, params: dict[str, float], x: np.ndarray, equity: Any = None) -> None:
-        nonlocal best_sharpe_local, best_params_local, best_equity_local
+        nonlocal best_sharpe_local, best_params_local, best_equity_local, _eval_count
+        _eval_count += 1
+        # DSR 惩罚：随评估次数增加，deflated sharpe 越来越低，
+        # 引导 GP 探索新区域而非过度搜索已知峰值。
+        dsr_value = _dsr_of(sharpe)
         X_hist.append(x)
-        Y_hist.append(sharpe)
+        Y_hist.append(dsr_value)  # GP 用 DSR 值训练，非原始 Sharpe
+        Sharpe_hist.append(sharpe)  # 审计修复：同步记录原始 Sharpe，供 Top-K 按真实值排序
         params_hist.append(params.copy())
+        # raw Sharpe 仍用于业务口径 best 比较（日志和 OOS 用原始值）
         if sharpe > best_sharpe_local:
             best_sharpe_local = sharpe
             best_params_local = params.copy()
@@ -480,9 +538,11 @@ def optimize_window(
     logger.info(f"  窗口优化完成: best_sharpe={best_sharpe:.4f}, 耗时={_opt_elapsed:.1f}s, params={best_params}")
 
     # ── 提取 top-K 参数用于 OOS 验证（PBO 需要多组 OOS 结果） ──
-    n_top = min(n_refine_top, len(Y_hist))
+    # 审计修复：按原始 Sharpe 排序，非 DSR。DSR 随 eval_count 递增惩罚，
+    # 后评估的高 Sharpe 参数会被压低，导致 Top-K 漏掉真正最优候选。
+    n_top = min(n_refine_top, len(Sharpe_hist))
     if n_top >= 2:
-        top_indices = np.argsort(Y_hist)[-n_top:]
+        top_indices = np.argsort(Sharpe_hist)[-n_top:]
         top_k_params = [params_hist[i] for i in top_indices]
     else:
         top_k_params = [best_params]

@@ -37,8 +37,7 @@ def main() -> None:
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
 
     # ── 初始化文件日志（必须先于所有业务代码） ──
-    # P0-10 ⑤：UtilsManager.LoggerManager 已删除，改用 loguru 文件 sink
-    # P2-12 审计修复：日志路径项目化——脱离 ~/Downloads/CoreNews_Reports/Logs，
+
     # 改为 {PROJECT_ROOT}/logs/，增加 LOG_DIR 环境变量覆盖，确保目录不存在时自动创建。
     import os as _os
     from pathlib import Path as _Path

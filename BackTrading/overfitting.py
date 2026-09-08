@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 import math
 from dataclasses import dataclass, field
 from typing import Any
@@ -14,8 +15,62 @@ def _ann_factor() -> int:
     return 244  # A股实际年化交易日数均值（非美股252）
 
 
+def _compute_sharpe_from_equity(
+    equity_curve: list[dict[str, Any]] | pd.DataFrame,
+    risk_free_rate: float = 0.03,
+) -> float:
+    """统一 Sharpe 计算入口（超额收益口径）。
+
+    所有下游函数（DSR / OOS 衰减 / Sortino）均应调用此函数，避免
+    各模块各自实现导致口径漂移。
+
+    Args:
+        equity_curve: 权益曲线（list of dict 或 DataFrame，含 portfolio_value 列）。
+        risk_free_rate: 年化无风险利率（默认 3%）。
+
+    Returns:
+        年化超额收益 Sharpe；数据不足时返回 0.0。
+    """
+    if isinstance(equity_curve, pd.DataFrame):
+        vals = equity_curve["portfolio_value"].values.astype(float)
+    else:
+        vals = np.array(
+            [e.get("portfolio_value", 0) for e in equity_curve], dtype=float
+        )
+
+    finite_mask = np.isfinite(vals)
+    if finite_mask.sum() < 2:
+        return 0.0
+    vals = vals[finite_mask]
+    if vals[0] <= 0:
+        return 0.0
+
+    returns = (vals[1:] - vals[:-1]) / vals[:-1]
+    returns = returns[np.isfinite(returns)]
+    if len(returns) < 2:
+        return 0.0
+
+    ann_factor = _ann_factor()
+    mu = returns.mean() * ann_factor
+    excess_mu = mu - risk_free_rate
+    sigma = returns.std(ddof=1) * math.sqrt(ann_factor)
+    return float(excess_mu / sigma) if sigma > 0 else 0.0
+
+
 # OOS 最少交易日数：低于此样本量时 Sharpe 估计噪声过大，衰减比不可判定
 _MIN_OOS_DAYS = 10
+
+# ── 三态分类：区分"策略无效" vs "真实过拟合" vs "策略偏弱" ──
+# 背景：原系统将 IS_Sharpe ≤ 0 报为"过拟合"，严重误导排障方向。
+# 三态逻辑：
+#   INVALID   → IS_Sharpe ≤ 0，策略在样本内都无超额收益，不是过拟合
+#   OVERFITTED → IS_Sharpe > 0 但衰减 > 50%（或 OOS Sharpe ≤ 0），真实过拟合
+#   WEAK      → IS_Sharpe > 0 且衰减 > 30% 但 ≤ 50%，策略信号偏弱
+class OverfitType(enum.Enum):
+    VALID = "VALID"           # 通过校验
+    INVALID = "INVALID"       # 策略无效：IS Sharpe ≤ 0，非过拟合
+    OVERFITTED = "OVERFITTED"  # 真实过拟合：IS 正但 OOS 衰减 > 50%
+    WEAK = "WEAK"             # 策略偏弱：IS 正但衰减 30%-50%
 
 
 def probabilistic_sharpe_ratio(
@@ -154,9 +209,19 @@ def compute_pbo(
 def compute_dsr_from_equity_curve(
     equity_curve: list[dict[Any, Any]],
     num_trials: int,
+    risk_free_rate: float = 0.03,
 ) -> float:
+    """计算 DSR，Sharpe 口径通过 _compute_sharpe_from_equity 保证一致（超额收益）。
+
+    Args:
+        equity_curve: 权益曲线。
+        num_trials: 寻优评估次数。
+        risk_free_rate: 年化无风险利率（默认 3%）。
+    """
     if len(equity_curve) < 2:
         return 0.5
+
+    sharpe = _compute_sharpe_from_equity(equity_curve, risk_free_rate)
 
     vals = pd.Series([e.get("portfolio_value", 0) for e in equity_curve]).values.astype(float)
     if len(vals) < 2:
@@ -167,7 +232,6 @@ def compute_dsr_from_equity_curve(
     if n < 2:
         return 0.5
 
-    sharpe = float(returns.mean() / returns.std()) * math.sqrt(_ann_factor()) if returns.std() > 0 else 0.0
     skew = float(pd.Series(returns).skew())  # type: ignore[arg-type]
     kurt = float(pd.Series(returns).kurtosis()) + 3.0  # type: ignore[arg-type]
 
@@ -180,12 +244,12 @@ def compute_dsr_from_equity_curve(
 
 @dataclass
 class OOSDecayReport:
-    """样本外衰减校验报告。
+    """样本外衰减校验报告（三态分类）。
 
-    业务定义：检验模型是否在历史特征上发生过度拟合（Overfitting）。
-    样本外夏普比率相对于样本内夏普比率的衰减幅度不得超过 30%。
-    若超过此阈值，判定模型对 XGBoost 等超参数进行了过度网格搜索，
-    或特征工程存在隐性泄露，结果直接废弃。
+    业务定义：区分三种失效场景，避免将"策略无效"误报为"过拟合"。
+      - INVALID:   IS_Sharpe ≤ 0，策略在样本内无超额收益，不是过拟合
+      - OVERFITTED: IS_Sharpe > 0 但衰减 > 50%（或 OOS Sharpe ≤ 0），真实过拟合
+      - WEAK:      IS_Sharpe > 0 但衰减 30%-50%，策略信号偏弱
     """
 
     # ── 输入 ──
@@ -200,6 +264,7 @@ class OOSDecayReport:
     sharpe_ratio: float = 1.0        # oos / is，>0.7 表示未超阈
 
     # ── 判定 ──
+    overfit_type: OverfitType = OverfitType.VALID
     passed: bool = False
     reason: str = ""
     details: list[str] = field(default_factory=list)
@@ -215,6 +280,7 @@ class OOSDecayReport:
             "is_sortino": round(self.is_sortino, 4),
             "oos_sortino": round(self.oos_sortino, 4),
             "sortino_decay_pct": f"{self.sortino_decay:.1%}",
+            "overfit_type": self.overfit_type.value,
             "passed": "PASS" if self.passed else "FAIL",
             "reason": self.reason,
             "is_days": self.is_sample_days,
@@ -222,10 +288,12 @@ class OOSDecayReport:
         }
 
     def log(self) -> None:
-        status = "PASS" if self.passed else "FAIL"
+        ftype = self.overfit_type.value
+        status = "PASS" if self.passed else f"FAIL({ftype})"
         logger.info(
             f"[OOS衰减校验] {status} | IS_Sharpe={self.is_sharpe:.2f} → "
-            f"OOS_Sharpe={self.oos_sharpe:.2f} (衰减 {self.sharpe_decay:.1%}) | "
+            f"OOS_Sharpe={self.oos_sharpe:.2f} "
+            f"(衰减 {self.sharpe_decay:.1%}) | "
             f"IS_Sortino={self.is_sortino:.2f} → OOS_Sortino={self.oos_sortino:.2f} "
             f"(衰减 {self.sortino_decay:.1%}) | {self.reason}"
         )
@@ -237,12 +305,16 @@ def _compute_risk_from_curve(
 ) -> tuple[float, float]:
     """从净值曲线计算年化 Sharpe 和 Sortino。
 
-    P3 审计修复：新增 risk_free_rate 参数，与 backtest_metrics.compute_risk_metrics
-    保持一致（超额收益口径），默认 3% 年化。
+    Sharpe 通过 _compute_sharpe_from_equity 统一入口计算，
+    Sortino 在此函数计算（仅 OOS 衰减校验需要 pair 返回）。
 
     Returns:
         (sharpe, sortino)
     """
+    # Sharpe 走统一入口，避免重复实现导致口径漂移
+    sharpe = _compute_sharpe_from_equity(equity_curve, risk_free_rate)
+
+    # Sortino 需要 returns 序列，此处保留实现
     if isinstance(equity_curve, pd.DataFrame):
         vals = equity_curve["portfolio_value"].values.astype(float)
     else:
@@ -257,18 +329,14 @@ def _compute_risk_from_curve(
 
     returns = (vals[1:] - vals[:-1]) / vals[:-1]
     returns = returns[np.isfinite(returns)]
-    n = len(returns)
-    if n < 2:
+    if len(returns) < 2:
         return 0.0, 0.0
 
     ann_factor = _ann_factor()
     mu = returns.mean() * ann_factor
-    excess_mu = mu - risk_free_rate  # P3 超额收益
-    sigma = returns.std(ddof=1) * math.sqrt(ann_factor)
-    sharpe = excess_mu / sigma if sigma > 0 else 0.0
+    excess_mu = mu - risk_free_rate
 
     downside = returns[returns < 0]
-    # P1/P3 对齐：无穷大 Sortino 截断为 100.0，使用超额收益
     _SORTINO_CEILING = 100.0
     if len(downside) == 0:
         sortino = _SORTINO_CEILING if excess_mu > 0 else 0.0
@@ -285,23 +353,27 @@ def validate_oos_decay(
     oos_equity_curve: list[dict[str, Any]] | pd.DataFrame,
     *,
     decay_threshold: float = 0.30,
+    weak_threshold: float = 0.50,
     is_days: int = 0,
     oos_days: int = 0,
 ) -> OOSDecayReport:
-    """样本外衰减校验 —— 核心 gate。
+    """样本外衰减校验（三态分类）—— 核心 gate。
+
+    三态判定逻辑：
+      - INVALID:   IS_Sharpe ≤ 0，策略在样本内无超额收益，不是过拟合
+      - OVERFITTED: IS_Sharpe > 0 但 OOS Sharpe ≤ 0（100% 衰减）或 Sharpe 衰减 > 50%
+      - WEAK:      IS_Sharpe > 0 且衰减 30%-50%，策略信号偏弱
 
     Args:
         is_equity_curve: 样本内（训练集）净值曲线。
         oos_equity_curve: 样本外（独立测试集）净值曲线。
-        decay_threshold: 衰减容忍度，默认 30%。
+        decay_threshold: 弱信号容忍度，默认 30%。
+        weak_threshold: 弱信号 vs 过拟合分界，默认 50%。
         is_days: 样本内交易日数（报告用）。
         oos_days: 样本外交易日数（报告用）。
 
     Returns:
-        OOSDecayReport —— passed=False 时结果应直接废弃。
-
-    Raises:
-        ValueError: 当样本内 Sharpe ≤ 0 时，拒绝计算衰减比（模型本身无信号）。
+        OOSDecayReport —— passed=False 时结果应直接废弃，overfit_type 指示原因。
     """
     report = OOSDecayReport(
         is_sample_days=is_days,
@@ -316,25 +388,34 @@ def validate_oos_decay(
     report.oos_sharpe = oos_sharpe
     report.oos_sortino = oos_sortino
 
-    # ── Guard: IS Sharpe ≤ 0 → 无信号，直接 FAIL ──
+    # ── Gate 1: IS Sharpe ≤ 0 → 策略无效（不是过拟合） ──
     if is_sharpe <= 0:
         report.passed = False
-        report.reason = "样本内 Sharpe ≤ 0，模型本身无超额收益信号，拒绝衰减计算"
+        report.overfit_type = OverfitType.INVALID
+        report.reason = (
+            f"策略无效：样本内 Sharpe = {is_sharpe:.2f} ≤ 0，"
+            f"模型在训练窗口本身无超额收益信号，非过拟合问题"
+        )
         report.log()
         return report
 
-    # ── Guard: OOS Sharpe ≤ 0 → 样本外完全失效，直接 FAIL ──
+    # ── Gate 2: OOS Sharpe ≤ 0 → 真实过拟合（IS 正但 OOS 完全失效） ──
     if oos_sharpe <= 0:
-        report.sharpe_decay = 1.0  # 100% 衰减
+        report.sharpe_decay = 1.0
         report.sortino_decay = 1.0
         report.passed = False
-        report.reason = "样本外 Sharpe ≤ 0，模型在样本外完全失效"
+        report.overfit_type = OverfitType.OVERFITTED
+        report.reason = (
+            f"过拟合：IS_Sharpe={is_sharpe:.2f} 但 OOS_Sharpe={oos_sharpe:.2f} ≤ 0，"
+            f"衰减 100%，模型在样本外完全失效"
+        )
         report.log()
         return report
 
-    # ── Guard: OOS 样本量不足 → Sharpe 估计噪声过大，衰减比不可判定，拒绝通过 ──
+    # ── Gate 3: OOS 样本量不足 ──
     if oos_days and oos_days < _MIN_OOS_DAYS:
         report.passed = False
+        report.overfit_type = OverfitType.WEAK
         report.reason = (
             f"样本外交易日仅 {oos_days} 天（<{_MIN_OOS_DAYS}），"
             f"Sharpe 估计噪声过大，无法可靠判定衰减"
@@ -355,23 +436,31 @@ def validate_oos_decay(
         sortino_decay = 0.0
     report.sortino_decay = max(sortino_decay, 0.0)  # Sortino 衰减下限 0（OOS 更好不报错）
 
-    # ── 判定：任一指标衰减超限则 FAIL ──
-    if sharpe_decay > decay_threshold:
+    # ── 三态判定 ──
+    if sharpe_decay > weak_threshold or sortino_decay > weak_threshold:
+        # 衰减 > 50% → 真实过拟合
         report.passed = False
+        report.overfit_type = OverfitType.OVERFITTED
         report.reason = (
-            f"Sharpe 衰减 {sharpe_decay:.1%} > {decay_threshold:.0%}，"
-            f"疑似超参数过度网格搜索或特征工程隐性泄露，结果废弃"
+            f"过拟合：IS_Sharpe={is_sharpe:.2f} → OOS_Sharpe={oos_sharpe:.2f}，"
+            f"Sharpe 衰减 {sharpe_decay:.1%} > {weak_threshold:.0%}，"
+            f"模型在样本外泛化能力严重不足，结果废弃"
         )
-    elif sortino_decay > decay_threshold:
+    elif sharpe_decay > decay_threshold or sortino_decay > decay_threshold:
+        # 衰减 30%-50% → 策略偏弱（告警但不直接废弃）
         report.passed = False
+        report.overfit_type = OverfitType.WEAK
         report.reason = (
-            f"Sortino 衰减 {sortino_decay:.1%} > {decay_threshold:.0%}，"
-            f"下行风险在样本外显著恶化，结果废弃"
+            f"策略偏弱：IS_Sharpe={is_sharpe:.2f} → OOS_Sharpe={oos_sharpe:.2f}，"
+            f"Sharpe 衰减 {sharpe_decay:.1%}（>{decay_threshold:.0%}）但 ≤ {weak_threshold:.0%}，"
+            f"策略信号偏弱，结果仅供参考"
         )
     else:
+        # 衰减 ≤ 30% → 通过
         report.passed = True
+        report.overfit_type = OverfitType.VALID
         report.reason = (
-            f"Sharpe 衰减 {sharpe_decay:.1%} ≤ {decay_threshold:.0%}，"
+            f"泛化通过：Sharpe 衰减 {sharpe_decay:.1%} ≤ {decay_threshold:.0%}，"
             f"Sortino 衰减 {sortino_decay:.1%} ≤ {decay_threshold:.0%}，"
             f"模型泛化性通过"
         )

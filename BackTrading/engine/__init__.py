@@ -10,7 +10,6 @@ from BackTrading.domain.models import CostModel, DEFAULT_TRANSFER_FEE_SEGMENTS
 
 
 # ═══════════════════════════════════════════════════════════
-# P2.6 子配置类 — 按功能域分组，EngineConfig 通过 @property
 # 暴露子视图；直接字段访问 engine_cfg.xxx 保持向后兼容。
 # ═══════════════════════════════════════════════════════════
 
@@ -181,7 +180,6 @@ class EngineConfig:
     # 当日成交量 × min(触板档比例, auction_fill_ratio)。假设文档化：
     # 成交价=开盘价（集合竞价价），开盘后向限价收敛的盘中成交不单独建模。
     auction_fill_ratio: float = 0.12
-    # ── 经验填充模型（limit_calibration.py）：用历史日线 V_t/V_prev 分位数
     # 替代固定比例常量（技术债：固定比例缺经验依据）。分钟/tick/盘口数据
     # 不在数据源内，经验分位是可行的统计替代：
     #   fixed            = 旧行为（固定比例常量）
@@ -191,13 +189,11 @@ class EngineConfig:
     # 统计（静态参数选择，应用时不带前视——竞价可成交量 = 前日量 × 校准分位）。
     limit_ratio_mode: str = "fixed"
     limit_calib_min_samples: int = 20
-    # ── 0.6 复牌跳空（停牌后复牌日开盘大幅跳空：补涨兑现 / 补跌标记） ──
     resume_gap_up: float = 0.05  # 复牌高开≥该比例（相对停牌前收盘）→ 开盘兑现卖出 + 当日禁买
     resume_gap_down: float = 0.05  # 复牌低开≤-该比例 → 日志标记（风控卖出照常）
-    # P2-5 修复：复牌跳空买入集合竞价成交率限制
     # 复牌跳空高开日集合竞价买入可成交比例（复牌日买方抢筹激烈，实际成交受限）
     resume_auction_fill_ratio: float = 0.15
-    # P1-6 修复：复牌跳空卖出流动性冲击放大系数
+
     # 复牌日成交量放大但实际流动性不足，冲击成本高于正常日
     resume_impact_multiplier: float = 2.0
     # ── 交易参数（P1-2：从 core.py 硬编码提升为配置驱动） ──
@@ -207,10 +203,8 @@ class EngineConfig:
     adv_amount_threshold_high: float = 1e8  # 高流动性阈值（元）
     adv_amount_threshold_low: float = 2e7   # 低流动性阈值（元）
     top_k: int = 20  # 每日最大候选买入数（集中资金，避免每只分到极小额度 < 1 手）
-    # ── P3-3（审计）挂单过期天数（P0-6 ②：A股订单当日有效，信号次日未成交即撤销） ──
     # 从 core.py 硬编码提升为配置项，便于研究（如"连续重挂 N 日"实验）；默认 1 保持原语义。
     order_expiry_days: int = 1
-    # ── P3-4（审计）上市日表严格模式：params._listing_days 缺失时 fail-fast ──
     # 默认 False 兼容旧行为（告警后停用新股豁免）；True 与数据质量门禁联动，
     # 杜绝"表缺失 → 静默停用豁免 → 结果口径改变"的低风险漂移。
     strict_listing_days: bool = False
@@ -228,7 +222,6 @@ class EngineConfig:
     regime_half_multiplier: float = 0.5  # 半仓倍率
     regime_min_multiplier: float = 0.25  # 最低仓位倍率
 
-    # ── P2-1 停牌盯市：停牌天数保守衰减折扣（无行业指数数据时的务实替代方案） ──
     # 停牌天数 > susp_decay_start_days 时，盯市价按 (1 - susp_daily_decay_rate)^(天数 - 起始天数) 折扣
     # 目的：防止长期停牌期间净值虚高（重大事项不确定性）；复牌日按实际成交价结算
     susp_decay_start_days: int = 10       # 停牌超过此天数开始衰减
@@ -258,7 +251,6 @@ class EngineConfig:
     optimizer_target_cash: float = 0.0
     # 求解超时 (秒)
     optimizer_solve_timeout: float = 5.0
-    # P3-3 优化：优化器日志详细度控制（WFO 路径下大量重复日志降噪）
     # True = 输出所有 debug/info 日志；False = 仅输出 warning 以上级别
     optimizer_verbose: bool = False
 
@@ -268,7 +260,6 @@ class EngineConfig:
     # 默认 60 个交易日（约一季度）；设为 0 表示关闭此限制。
     max_hold_days: int = 60
 
-    # ── P2.6 子配置视图属性（不破坏 engine_cfg.xxx 直接访问兼容性） ──
     @property
     def cost(self) -> CostConfig:
         """交易成本子配置视图"""
@@ -444,7 +435,6 @@ __all__ = [
     "run_full_backtest",
     "_run_single_backtest",
     "_MIN_SLIPPAGE_FLOOR",
-    # P1.1 拆分模块
     "PositionState",
     "CostAccum",
     "CostCalculator",
